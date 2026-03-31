@@ -31,8 +31,10 @@ Stage definitions (reminder)
 
 import json
 import logging
+import queue
 import sys
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -124,11 +126,14 @@ You have access to scored evidence across five pipeline stages:
 
 Your job is to:
   1. Confirm or refine the computed overall_stage based on the evidence.
-  2. Write a concise (3–5 sentence) narrative explaining the stage assessment.
+  2. Write a concise (3–5 sentence) narrative explaining the stage assessment. \
+     Incorporate the velocity data — e.g. "this technology is Stage 3 and \
+     accelerating rapidly — estimated Stage 4 within 12–18 months."
   3. Cite at least one specific piece of evidence per active stage \
      (e.g. paper title, company name, news headline).
   4. Flag any conflicting signals (e.g. mainstream trend but no patents).
-  5. Predict the most likely next stage transition and what would trigger it.
+  5. Predict the most likely next stage transition and what would trigger it, \
+     using the estimated_next_stage_months from VELOCITY ANALYSIS when available.
 
 IMPORTANT RULES:
   - Never hallucinate evidence. Only reference documents explicitly present \
@@ -136,6 +141,8 @@ IMPORTANT RULES:
   - Every factual claim must be followed by a citation in brackets: \
     [Source: <name>, <date>]
   - If a stage score is 0, state that no signal was found for that stage.
+  - Use velocity data to add momentum language: "accelerating", "stalling", \
+    "cooling off", "gaining rapidly", etc.
   - Output valid JSON matching the schema below. No markdown fences.
 
 Output schema:
@@ -143,7 +150,12 @@ Output schema:
   "confirmed_stage": <int 1-5>,
   "stage_label": "<Academic|Developer|Investment|BigTech|Mainstream>",
   "confidence": "<High|Medium|Low>",
-  "narrative": "<3-5 sentence plain-English explanation with inline citations>",
+  "narrative": "<3-5 sentence plain-English explanation with inline citations and velocity language>",
+  "velocity_assessment": {
+    "direction": "<accelerating|stable|decelerating>",
+    "summary": "<one sentence on momentum>",
+    "estimated_next_stage_months": <int or null>
+  },
   "evidence_by_stage": {
     "stage_1": ["<cited evidence string>", ...],
     "stage_2": [...],
@@ -154,7 +166,8 @@ Output schema:
   "conflicting_signals": ["<description>", ...],
   "next_stage_prediction": {
     "stage": <int>,
-    "trigger": "<what would cause this transition>"
+    "trigger": "<what would cause this transition>",
+    "estimated_months": <int or null>
   },
   "sources_cited": [
     {"type": "<paper|company|article|patent|trend>", "name": "<title>", "date": "<ISO date or year>"}
@@ -169,6 +182,101 @@ _STAGE_LABELS = {
     4: "BigTech",
     5: "Mainstream",
 }
+
+# ---------------------------------------------------------------------------
+# Self-critique prompt and schema
+# ---------------------------------------------------------------------------
+
+_CRITIQUE_SYSTEM_PROMPT = """\
+You are a Critical Quality Reviewer for a Technology Pipeline Analyst system. \
+Your sole job is to evaluate the accuracy and evidence coverage of a stage \
+assessment that another model produced.
+
+You will receive:
+  EVIDENCE BLOCK — the raw data that was available when the assessment was made.
+  INITIAL ASSESSMENT — the JSON conclusion the analyst reached.
+
+Your task is to scrutinise the assessment against the evidence and produce a \
+structured critique.  Be strict: only count a claim as supported if the \
+supporting item is explicitly named in the EVIDENCE BLOCK.
+
+Definitions
+───────────
+  Supporting evidence   : Items from the EVIDENCE BLOCK that directly confirm \
+the stage conclusion or a specific claim in the narrative.
+  Contradicting evidence: Items from the EVIDENCE BLOCK that weaken, \
+contradict, or are inconsistent with the stage conclusion.
+  Unsupported claims    : Specific statements in the narrative that cannot be \
+traced to any item in the EVIDENCE BLOCK — potential hallucinations.
+
+Confidence score (0–100)
+────────────────────────
+  90–100  All key claims backed by named evidence; stage conclusion strongly supported.
+  70–89   Good coverage; minor details inferred but core conclusion is solid.
+  50–69   Partial evidence; plausible but meaningful gaps remain.
+  30–49   Thin evidence; conclusion is largely inferential.
+   0–29   Very little evidence; conclusion is mostly speculative.
+
+Reliability
+───────────
+  "High"   — confidence_score ≥ 70
+  "Medium" — confidence_score 40–69
+  "Low"    — confidence_score < 40
+
+RULES:
+  - Reference only items explicitly present in the EVIDENCE BLOCK.
+  - Quote or paraphrase the specific claim when listing unsupported_claims.
+  - Output valid JSON only.  No markdown fences, no commentary outside the JSON.
+
+Output schema:
+{
+  "confidence_score": <int 0-100>,
+  "reliability": "<High|Medium|Low>",
+  "supporting_evidence": ["<item from evidence block>", ...],
+  "contradicting_evidence": ["<item that weakens the conclusion>", ...],
+  "unsupported_claims": ["<verbatim or paraphrased claim with no evidence>", ...]
+}
+"""
+
+_CRITIQUE_MAX_TOKENS = 1024
+
+
+def _merge_assessment_and_critique(assessment: dict, critique: dict) -> dict:
+    """
+    Combines the initial assessment (first Claude call) with the critique
+    (second Claude call) into the final output dict.
+
+    The first call's qualitative confidence label ("High"/"Medium"/"Low") is
+    replaced by the critique's numeric score (0–100) and reliability rating
+    so callers get a single, auditable confidence value.
+
+    All original assessment fields are preserved — the critique adds to them
+    rather than replacing them.
+    """
+    return {
+        # Core identification — from first call
+        "stage":                  assessment.get("confirmed_stage"),
+        "stage_label":            assessment.get("stage_label", ""),
+        # Evidence quality — from second (critique) call
+        "confidence":             critique.get("confidence_score", 50),
+        "reliability":            critique.get("reliability", "Medium"),
+        # Narrative — from first call (with citations)
+        "narrative":              assessment.get("narrative", ""),
+        # Critique outputs
+        "supporting_evidence":    critique.get("supporting_evidence", []),
+        "contradicting_evidence": critique.get("contradicting_evidence", []),
+        "unsupported_claims":     critique.get("unsupported_claims", []),
+        # Velocity — from first call
+        "velocity_assessment":    assessment.get("velocity_assessment", {}),
+        # Full evidence breakdown — from first call
+        "evidence_by_stage":      assessment.get("evidence_by_stage", {}),
+        "conflicting_signals":    assessment.get("conflicting_signals", []),
+        "next_stage_prediction":  assessment.get("next_stage_prediction", {}),
+        "sources_cited":          assessment.get("sources_cited", []),
+        # Raw outputs preserved for auditing
+        "_raw_assessment":        assessment,
+        "_raw_critique":          critique,
+    }
 
 
 def _build_evidence_prompt(research: dict) -> str:
@@ -247,6 +355,22 @@ def _build_evidence_prompt(research: dict) -> str:
             src = ev.get("source", "?")
             lines.append(f'  Stage {stage_n} ({label}): first detected {ts} via {src}')
 
+    velocity = research.get("velocity", {})
+    if velocity:
+        lines += ["", "=== VELOCITY ANALYSIS ==="]
+        lines.append(f'  Summary       : {velocity.get("velocity_summary", "N/A")}')
+        lines.append(f'  Overall       : {velocity.get("overall_velocity", "N/A")} '
+                     f'({velocity.get("score_growth_per_month", 0):+.1f} pts/month)')
+        lines.append(f'  Academic      : {velocity.get("academic_velocity", "N/A")} '
+                     f'(YoY growth: {velocity.get("academic_growth_rate", 0):+.1f}%)')
+        lines.append(f'  Startup       : {velocity.get("startup_velocity", "N/A")}')
+        lines.append(f'  News/Press    : {velocity.get("news_velocity", "N/A")}')
+        next_months = velocity.get("estimated_next_stage_months")
+        if next_months is not None:
+            lines.append(f'  Next stage in : ~{next_months} months (data-driven estimate)')
+        else:
+            lines.append(  '  Next stage in : insufficient history to estimate')
+
     raw_summary = research.get("raw_summary", {})
     if raw_summary:
         lines += ["", "=== RAW FETCH SUMMARY ===", json.dumps(raw_summary, indent=2)]
@@ -284,14 +408,24 @@ class AnalystAgent:
 
     def analyse(self, query: str) -> dict:
         """
-        Full analysis: research + Claude reasoning.
+        Full analysis: research → stage assessment → self-critique → merge.
+
+        Two Claude calls are made:
+          Call 1 — stage assessment (full evidence prompt → JSON assessment)
+          Call 2 — self-critique   (assessment + evidence → confidence score,
+                                    supporting/contradicting evidence,
+                                    unsupported claims)
+
+        Both calls are logged to SQLite query_history for auditing.
 
         Returns:
             {
                 "query": str,
-                "research": dict,          # ResearchResult
-                "assessment": dict,        # Claude JSON output
-                "raw_response": str,       # full Claude text
+                "research": dict,       # ResearchResult
+                "assessment": dict,     # merged final output (see _merge_assessment_and_critique)
+                "velocity": dict,
+                "raw_response": str,    # Call 1 raw text
+                "raw_critique": str,    # Call 2 raw text
                 "prov": dict,
                 "logged_at": str,
             }
@@ -301,17 +435,15 @@ class AnalystAgent:
 
         # --- Step 1: gather evidence ----------------------------------------
         research = self._researcher.full_research(query)
-
-        # --- Step 2: build prompt -------------------------------------------
         evidence_text = _build_evidence_prompt(research)
+
+        # --- Step 2: Call 1 — stage assessment ------------------------------
         user_message = (
             f"Please analyse the following evidence and produce your structured "
             f"JSON assessment.\n\n{evidence_text}"
         )
-
-        # --- Step 3: call Claude --------------------------------------------
-        logger.info("Calling Claude %s", self._model)
-        self._log_tool_call("claude_api", {"model": self._model, "query": query})
+        logger.info("Call 1 — stage assessment (model=%s)", self._model)
+        self._log_tool_call("claude_api:assessment", {"model": self._model, "query": query})
 
         try:
             message = self._client.messages.create(
@@ -321,16 +453,39 @@ class AnalystAgent:
                 messages=[{"role": "user", "content": user_message}],
             )
         except anthropic.APIStatusError as e:
-            logger.error("Anthropic API rejected request: %s", e)
+            logger.error("Anthropic API rejected assessment request: %s", e)
             raise RuntimeError(_anthropic_failure_message(e)) from e
 
-        raw_text = message.content[0].text if message.content else ""
-        self._log_tool_response("claude_api", raw_text[:500])
+        raw_assessment = message.content[0].text if message.content else ""
+        self._log_tool_response("claude_api:assessment", raw_assessment[:500])
+        assessment = self._parse_assessment(raw_assessment, research)
 
-        # --- Step 4: parse JSON --------------------------------------------
-        assessment = self._parse_assessment(raw_text, research)
+        # Log Call 1 to SQLite immediately for audit trail
+        self._sqlite.log_query(
+            query=query,
+            response=raw_assessment,
+            sources=[s.get("name", "") for s in assessment.get("sources_cited", [])],
+        )
 
-        # --- Step 5: lineage -----------------------------------------------
+        # --- Step 3: Call 2 — self-critique ---------------------------------
+        logger.info("Call 2 — self-critique (model=%s)", self._model)
+        raw_critique, critique = self._run_critique(
+            assessment=assessment,
+            evidence_text=evidence_text,
+            query=query,
+        )
+
+        # Log Call 2 to SQLite — tagged with "[critique]" for easy filtering
+        self._sqlite.log_query(
+            query=f"{query} [critique]",
+            response=raw_critique,
+            sources=[],
+        )
+
+        # --- Step 4: merge ---------------------------------------------------
+        final = _merge_assessment_and_critique(assessment, critique)
+
+        # --- Step 5: lineage -------------------------------------------------
         ended = datetime.now(timezone.utc).isoformat()
         prov = self._lineage.record_query(
             agent="analyst",
@@ -338,28 +493,24 @@ class AnalystAgent:
             response_id=f"analysis:{query}:{ended}",
             used_entities=[p["prov:entity"] for p in research.get("prov", []) if p],
             attributes={
-                "confirmed_stage": assessment.get("confirmed_stage"),
-                "confidence": assessment.get("confidence"),
-                "model": self._model,
-                "started_at": started,
-                "ended_at": ended,
+                "confirmed_stage":  final.get("stage"),
+                "confidence_score": final.get("confidence"),
+                "reliability":      final.get("reliability"),
+                "model":            self._model,
+                "started_at":       started,
+                "ended_at":         ended,
             },
         )
 
-        # --- Step 6: log query to SQLite -----------------------------------
-        self._sqlite.log_query(
-            query=query,
-            response=raw_text,
-            sources=[s.get("name", "") for s in assessment.get("sources_cited", [])],
-        )
-
         return {
-            "query": query,
-            "research": research,
-            "assessment": assessment,
-            "raw_response": raw_text,
-            "prov": prov,
-            "logged_at": ended,
+            "query":        query,
+            "research":     research,
+            "assessment":   final,
+            "velocity":     research.get("velocity", {}),
+            "raw_response": raw_assessment,
+            "raw_critique": raw_critique,
+            "prov":         prov,
+            "logged_at":    ended,
         }
 
     def analyse_stream(self, query: str) -> Iterator[str]:
@@ -376,9 +527,40 @@ class AnalystAgent:
         logger.info("analyse_stream: query=%r", query)
         started = datetime.now(timezone.utc).isoformat()
 
-        # --- Step 1: research (blocking — pipeline must complete first) -----
-        yield _sse({"event": "status", "message": "Fetching data sources..."})
-        research = self._researcher.full_research(query)
+        # --- Step 1: research with live progress events ----------------------
+        # Run full_research() in a background thread so the generator can yield
+        # progress SSE events as each pipeline stage completes.
+        progress_q: queue.SimpleQueue = queue.SimpleQueue()
+        result_box: dict = {}
+        error_box:  dict = {}
+
+        def _research_worker() -> None:
+            try:
+                result_box["data"] = self._researcher.full_research(
+                    query,
+                    progress_callback=lambda msg: progress_q.put(msg),
+                )
+            except Exception as exc:
+                error_box["err"] = exc
+            finally:
+                progress_q.put(None)  # sentinel — drain complete
+
+        t = threading.Thread(target=_research_worker, daemon=True)
+        t.start()
+
+        # Yield progress events until the sentinel arrives
+        while True:
+            msg = progress_q.get()
+            if msg is None:
+                break
+            yield _sse({"event": "status", "message": msg})
+
+        t.join()
+
+        if "err" in error_box:
+            raise error_box["err"]
+
+        research = result_box["data"]
         scores = research.get("scores", {})
         yield _sse({
             "event": "scores",
@@ -393,7 +575,7 @@ class AnalystAgent:
             f"JSON assessment.\n\n{evidence_text}"
         )
 
-        yield _sse({"event": "status", "message": "Claude reasoning..."})
+        yield _sse({"event": "status", "message": "Running analyst agent..."})
         self._log_tool_call("claude_api_stream", {"model": self._model, "query": query})
 
         full_text = []
@@ -415,8 +597,29 @@ class AnalystAgent:
         raw_text = "".join(full_text)
         self._log_tool_response("claude_api_stream", raw_text[:500])
 
-        # --- Step 3: parse and emit final assessment ------------------------
+        # --- Step 3: parse Call 1 and log to SQLite -------------------------
         assessment = self._parse_assessment(raw_text, research)
+        self._sqlite.log_query(
+            query=query,
+            response=raw_text,
+            sources=[s.get("name", "") for s in assessment.get("sources_cited", [])],
+        )
+
+        # --- Step 4: self-critique (blocking) --------------------------------
+        yield _sse({"event": "status", "message": "Running self-critique..."})
+        raw_critique, critique = self._run_critique(
+            assessment=assessment,
+            evidence_text=evidence_text,
+            query=query,
+        )
+        self._sqlite.log_query(
+            query=f"{query} [critique]",
+            response=raw_critique,
+            sources=[],
+        )
+
+        # --- Step 5: merge and emit final event ------------------------------
+        final = _merge_assessment_and_critique(assessment, critique)
 
         ended = datetime.now(timezone.utc).isoformat()
         prov = self._lineage.record_query(
@@ -425,25 +628,22 @@ class AnalystAgent:
             response_id=f"analysis:{query}:{ended}",
             used_entities=[p["prov:entity"] for p in research.get("prov", []) if p],
             attributes={
-                "confirmed_stage": assessment.get("confirmed_stage"),
-                "confidence": assessment.get("confidence"),
-                "model": self._model,
-                "started_at": started,
-                "ended_at": ended,
-                "streamed": True,
+                "confirmed_stage":  final.get("stage"),
+                "confidence_score": final.get("confidence"),
+                "reliability":      final.get("reliability"),
+                "model":            self._model,
+                "started_at":       started,
+                "ended_at":         ended,
+                "streamed":         True,
             },
-        )
-
-        self._sqlite.log_query(
-            query=query,
-            response=raw_text,
-            sources=[s.get("name", "") for s in assessment.get("sources_cited", [])],
         )
 
         yield _sse({
             "event": "complete",
             "query": query,
-            "assessment": assessment,
+            "assessment": final,
+            "velocity": research.get("velocity", {}),
+            "raw_critique": raw_critique,
             "prov": prov,
             "logged_at": ended,
         })
@@ -485,6 +685,92 @@ class AnalystAgent:
                 "sources_cited": [],
                 "_parse_error": True,
             }
+
+    def _run_critique(
+        self,
+        assessment: dict,
+        evidence_text: str,
+        query: str,
+    ) -> tuple[str, dict]:
+        """
+        Call 2 — self-critique.
+
+        Sends the initial assessment JSON alongside the original evidence block
+        to Claude using _CRITIQUE_SYSTEM_PROMPT.  Returns (raw_text, parsed_dict).
+        Falls back to a safe default critique dict on any error so the overall
+        analyse() call is never blocked by the critique step.
+        """
+        self._log_tool_call("claude_api:critique", {"model": self._model, "query": query})
+
+        user_message = (
+            "EVIDENCE BLOCK:\n"
+            f"{evidence_text}\n\n"
+            "INITIAL ASSESSMENT:\n"
+            f"{json.dumps(assessment, indent=2, default=str)}\n\n"
+            "Please produce your structured critique JSON."
+        )
+
+        try:
+            message = self._client.messages.create(
+                model=self._model,
+                max_tokens=_CRITIQUE_MAX_TOKENS,
+                system=_CRITIQUE_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.APIStatusError as e:
+            logger.warning("Self-critique Call 2 failed (API error): %s", e)
+            raw = ""
+            return raw, self._fallback_critique()
+        except Exception as e:
+            logger.warning("Self-critique Call 2 failed (unexpected): %s", e)
+            return "", self._fallback_critique()
+
+        raw = message.content[0].text if message.content else ""
+        self._log_tool_response("claude_api:critique", raw[:500])
+        return raw, self._parse_critique(raw)
+
+    @staticmethod
+    def _parse_critique(raw_text: str) -> dict:
+        """
+        Parse the critique JSON response.
+        Falls back to a safe default dict if the response is not valid JSON.
+        """
+        text = raw_text.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(ln for ln in lines if not ln.startswith("```")).strip()
+
+        try:
+            critique = json.loads(text)
+            # Ensure all expected keys are present
+            critique.setdefault("confidence_score", 50)
+            critique.setdefault("reliability", "Medium")
+            critique.setdefault("supporting_evidence", [])
+            critique.setdefault("contradicting_evidence", [])
+            critique.setdefault("unsupported_claims", [])
+            return critique
+        except json.JSONDecodeError:
+            logger.warning("Critique response was not valid JSON — using fallback")
+            return {
+                "confidence_score": 50,
+                "reliability": "Medium",
+                "supporting_evidence": [],
+                "contradicting_evidence": [],
+                "unsupported_claims": ["Critique parse failed — raw response not valid JSON."],
+                "_parse_error": True,
+            }
+
+    @staticmethod
+    def _fallback_critique() -> dict:
+        """Safe default critique returned when Call 2 itself fails."""
+        return {
+            "confidence_score": 50,
+            "reliability": "Medium",
+            "supporting_evidence": [],
+            "contradicting_evidence": [],
+            "unsupported_claims": [],
+            "_critique_skipped": True,
+        }
 
     def _log_tool_call(self, tool: str, params: dict) -> None:
         """Structured log for observability / hallucination auditing."""

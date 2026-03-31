@@ -66,8 +66,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     port = args.port
+    print(f"Dashboard running at http://localhost:{port}")
+    print(f"API docs at         http://localhost:{port}/docs")
     logger.info("Starting agent service on http://0.0.0.0:%d", port)
-    logger.info("API docs: http://localhost:%d/docs", port)
 
     uvicorn.run(
         "api.agent_service:app",

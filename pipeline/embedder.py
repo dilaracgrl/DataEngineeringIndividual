@@ -63,7 +63,7 @@ This makes overall_score directly readable as "percentage through the pipeline."
 
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -662,9 +662,272 @@ class DataEmbedder:
         )
         return scores
 
-    # ── 3. Full pipeline ──────────────────────────────────────────────────────
+    # ── 3. Velocity analysis ──────────────────────────────────────────────────
 
-    def run_full_pipeline(self, query: str) -> dict:
+    def calculate_velocity(self, query: str) -> dict:
+        """
+        Measures how fast a technology is moving through the pipeline stages
+        by comparing data volumes across time windows stored in MongoDB and
+        SQLite.
+
+        Four independent signals are computed:
+
+          academic_velocity  — year-on-year paper count change in MongoDB
+                               (arxiv + S2 combined, using published / year field)
+          startup_velocity   — older-half vs newer-half monthly repo creation
+                               rate in MongoDB github_repos
+          news_velocity      — article count: last 30 days vs prior 30 days
+                               in MongoDB news collection
+          overall_velocity   — overall_score progression across SQLite
+                               trend_scores history rows
+
+        Each signal is labelled:
+          "accelerating"  — growth > +20 %
+          "stable"        — growth within ±20 %
+          "decelerating"  — growth < −20 %
+
+        estimated_next_stage_months uses the SPECIFIC signal scores for the
+        next stage (e.g. news_score if current stage is 2) and their growth
+        rate from SQLite history to estimate when they will cross the stage
+        activation threshold.  Returns None when there is insufficient
+        history, the signal is decelerating, or the estimate exceeds 5 years.
+        """
+        _ACCEL = "accelerating"
+        _STABLE = "stable"
+        _DECEL  = "decelerating"
+
+        def _label(pct: float) -> str:
+            return _ACCEL if pct > 20 else (_DECEL if pct < -20 else _STABLE)
+
+        now = datetime.now(timezone.utc)
+
+        # ── 1. Academic velocity (MongoDB papers, group by year) ─────────────
+        academic_velocity  = _STABLE
+        academic_growth_rate = 0.0
+        try:
+            papers = self._mongo.find_by_query("papers", query, limit=300)
+            by_year: dict[int, int] = {}
+            for p in papers:
+                yr: int | None = None
+                if isinstance(p.get("year"), int):
+                    yr = p["year"]
+                else:
+                    raw_date = p.get("published") or p.get("date") or ""
+                    if len(str(raw_date)) >= 4:
+                        try:
+                            yr = int(str(raw_date)[:4])
+                        except ValueError:
+                            pass
+                if yr and 2015 <= yr <= now.year:
+                    by_year[yr] = by_year.get(yr, 0) + 1
+
+            y_old = now.year - 2   # e.g. 2023 for current year 2025
+            y_new = now.year - 1   # e.g. 2024
+            c_old = by_year.get(y_old, 0)
+            c_new = by_year.get(y_new, 0)
+            if c_old > 0:
+                academic_growth_rate = round(((c_new - c_old) / c_old) * 100, 1)
+            elif c_new > 0:
+                academic_growth_rate = 100.0   # appeared from nothing
+            academic_velocity = _label(academic_growth_rate)
+            logger.debug("velocity | academic by_year=%s growth=%.1f%%", by_year, academic_growth_rate)
+        except Exception as exc:
+            logger.warning("velocity | academic query failed: %s", exc)
+
+        # ── 2. Startup velocity (MongoDB github_repos, monthly repo creation) ─
+        startup_velocity = _STABLE
+        try:
+            repos = self._mongo.find_by_query("github_repos", query, limit=200)
+            months: dict[str, int] = {}
+            for r in repos:
+                created = r.get("created_at") or r.get("date") or ""
+                if len(str(created)) >= 7:
+                    ym = str(created)[:7]   # "YYYY-MM"
+                    months[ym] = months.get(ym, 0) + 1
+
+            if len(months) >= 4:
+                sorted_ym = sorted(months.keys())
+                mid = len(sorted_ym) // 2
+                older_avg = sum(months[m] for m in sorted_ym[:mid]) / mid
+                newer_avg = sum(months[m] for m in sorted_ym[mid:]) / (len(sorted_ym) - mid)
+                if older_avg > 0:
+                    startup_growth = ((newer_avg - older_avg) / older_avg) * 100
+                    startup_velocity = _label(startup_growth)
+                elif newer_avg > 0:
+                    startup_velocity = _ACCEL
+        except Exception as exc:
+            logger.warning("velocity | startup query failed: %s", exc)
+
+        # ── 3. News velocity (last 30 days vs prior 30 days) ─────────────────
+        news_velocity = _STABLE
+        try:
+            articles = self._mongo.find_by_query("news", query, limit=300)
+            cutoff_recent = now - timedelta(days=30)
+            cutoff_prior  = now - timedelta(days=60)
+            recent_count = prior_count = 0
+            for a in articles:
+                pub_raw = (
+                    a.get("publishedAt") or a.get("published_at")
+                    or a.get("date") or a.get("fetched_at") or ""
+                )
+                if not pub_raw or len(str(pub_raw)) < 10:
+                    continue
+                try:
+                    pub_dt = datetime.fromisoformat(str(pub_raw)[:19].replace("Z", "+00:00"))
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                if pub_dt >= cutoff_recent:
+                    recent_count += 1
+                elif pub_dt >= cutoff_prior:
+                    prior_count += 1
+
+            if prior_count > 0:
+                news_growth = ((recent_count - prior_count) / prior_count) * 100
+                news_velocity = _label(news_growth)
+            elif recent_count > 0:
+                news_velocity = _ACCEL
+        except Exception as exc:
+            logger.warning("velocity | news query failed: %s", exc)
+
+        # ── 4. Overall velocity (SQLite trend_scores history) ────────────────
+        overall_velocity      = _STABLE
+        score_growth_per_month = 0.0
+        months_elapsed        = 1.0
+        history: list[dict]   = []
+        current_stage         = 1
+        current_score         = 0.0
+
+        try:
+            history = self._sqlite.get_trend_history(query, limit=10)
+            if len(history) >= 2:
+                newest = history[0]
+                oldest = history[-1]
+                current_stage = newest.get("overall_stage", 1)
+                current_score = float(newest.get("overall_score", 0))
+                score_delta   = current_score - float(oldest.get("overall_score", 0))
+
+                ts_new = newest.get("timestamp", "")
+                ts_old = oldest.get("timestamp", "")
+                if ts_new and ts_old:
+                    try:
+                        dt_new = datetime.fromisoformat(str(ts_new)[:19])
+                        dt_old = datetime.fromisoformat(str(ts_old)[:19])
+                        days = max(1, (dt_new - dt_old).days)
+                        months_elapsed = max(0.5, days / 30.0)
+                    except ValueError:
+                        pass
+
+                score_growth_per_month = score_delta / months_elapsed
+                overall_velocity = (
+                    _ACCEL if score_growth_per_month > 2
+                    else _DECEL if score_growth_per_month < -2
+                    else _STABLE
+                )
+            elif len(history) == 1:
+                current_stage = history[0].get("overall_stage", 1)
+                current_score = float(history[0].get("overall_score", 0))
+        except Exception as exc:
+            logger.warning("velocity | SQLite history query failed: %s", exc)
+
+        # ── 5. Estimated months to next stage ────────────────────────────────
+        # Uses the specific signal columns for the NEXT stage and their
+        # growth rate from SQLite history, so the estimate is tied to the
+        # actual signals that must activate — not just the overall_score.
+        #
+        # Columns to watch per current stage:
+        #   Stage 1 (academic)   → watch github_score, producthunt_score, yc_score (threshold 30)
+        #   Stage 2 (developer)  → watch news_score, techcrunch_score (threshold 30)
+        #   Stage 3 (investment) → watch patents_score (threshold 30)
+        #   Stage 4 (big tech)   → watch wikipedia_score (threshold 50), trends_score (60)
+        _NEXT_STAGE_SIGNALS: dict[int, list[str]] = {
+            1: ["github_score", "producthunt_score", "yc_score"],
+            2: ["news_score", "techcrunch_score"],
+            3: ["patents_score"],
+            4: ["wikipedia_score", "trends_score"],
+        }
+        _NEXT_STAGE_THRESHOLD: dict[int, float] = {
+            1: 30.0, 2: 30.0, 3: 30.0, 4: 50.0,
+        }
+
+        estimated_next_stage_months: int | None = None
+        try:
+            if len(history) >= 2 and current_stage < 5:
+                sig_cols  = _NEXT_STAGE_SIGNALS.get(current_stage, [])
+                threshold = _NEXT_STAGE_THRESHOLD.get(current_stage, 30.0)
+
+                newest_sig = max(
+                    (float(history[0].get(c, 0) or 0) for c in sig_cols),
+                    default=0.0,
+                )
+                oldest_sig = max(
+                    (float(history[-1].get(c, 0) or 0) for c in sig_cols),
+                    default=0.0,
+                )
+                sig_growth_per_month = (newest_sig - oldest_sig) / months_elapsed
+                points_needed = max(0.0, threshold - newest_sig)
+
+                if points_needed == 0:
+                    estimated_next_stage_months = 0
+                elif sig_growth_per_month > 0:
+                    raw_months = points_needed / sig_growth_per_month
+                    estimated_next_stage_months = (
+                        round(raw_months) if raw_months <= 60 else None
+                    )
+        except Exception as exc:
+            logger.warning("velocity | next-stage estimation failed: %s", exc)
+
+        # ── 6. One-sentence summary ───────────────────────────────────────────
+        _DIRECTION = {
+            _ACCEL: "rapidly gaining momentum",
+            _STABLE: "holding steady",
+            _DECEL:  "losing momentum",
+        }
+        # Dominant direction: bias toward acceleration when any signal is up
+        dominant = overall_velocity
+        if overall_velocity == _STABLE and (
+            academic_velocity == _ACCEL or news_velocity == _ACCEL
+        ):
+            dominant = _ACCEL
+
+        parts = [f"This technology is {_DIRECTION[dominant]}"]
+        if academic_velocity == _ACCEL and academic_growth_rate > 0:
+            parts.append(
+                f"academic output up {academic_growth_rate:.0f}% year-over-year"
+            )
+        if news_velocity == _ACCEL:
+            parts.append("press coverage accelerating")
+        elif news_velocity == _DECEL:
+            parts.append("press coverage cooling")
+        if estimated_next_stage_months is not None and estimated_next_stage_months > 0:
+            parts.append(
+                f"estimated Stage {current_stage + 1} transition in "
+                f"~{estimated_next_stage_months} months"
+            )
+        velocity_summary = " — ".join(parts[:3]) + "."
+
+        result = {
+            "academic_velocity":           academic_velocity,
+            "academic_growth_rate":        academic_growth_rate,
+            "startup_velocity":            startup_velocity,
+            "news_velocity":               news_velocity,
+            "overall_velocity":            overall_velocity,
+            "score_growth_per_month":      round(score_growth_per_month, 2),
+            "estimated_next_stage_months": estimated_next_stage_months,
+            "velocity_summary":            velocity_summary,
+        }
+        logger.info(
+            "calculate_velocity | query=%r | overall=%s | academic=%s(%.0f%%) "
+            "startup=%s | news=%s | next_stage=%s months",
+            query, overall_velocity, academic_velocity, academic_growth_rate,
+            startup_velocity, news_velocity, str(estimated_next_stage_months),
+        )
+        return result
+
+    # ── 4. Full pipeline ──────────────────────────────────────────────────────
+
+    def run_full_pipeline(self, query: str, progress_callback=None) -> dict:
         """
         End-to-end pipeline: fetch → clean → embed/store → score.
 
@@ -681,7 +944,9 @@ class DataEmbedder:
           5. sqlite_db.save_trend_score()  — persists scores for history
 
         Args:
-            query : Technology or concept to analyse.
+            query             : Technology or concept to analyse.
+            progress_callback : Optional callable(str) for streaming progress
+                                messages to the UI during the pipeline run.
 
         Returns:
             dict:
@@ -699,6 +964,10 @@ class DataEmbedder:
         if not query or not query.strip():
             raise ValueError("query must be a non-empty string")
 
+        def _cb(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+
         query = query.strip()
         started = datetime.now(timezone.utc).isoformat()
         logger.info("=" * 60)
@@ -706,9 +975,10 @@ class DataEmbedder:
         logger.info("=" * 60)
 
         # 1. Fetch
-        raw = self._fetcher.fetch_all(query)
+        raw = self._fetcher.fetch_all(query, progress_callback=progress_callback)
 
         # 2. Clean
+        _cb("Computing embeddings...")
         cleaned = self._cleaner.clean_all(raw)
 
         # 3. Embed and store
@@ -725,10 +995,29 @@ class DataEmbedder:
             scores_dict=scores,
         )
 
+        # 6. Velocity — runs AFTER save_trend_score so the row we just wrote
+        #    is available in the SQLite history for growth-rate comparison.
+        velocity = self._safe(
+            "calculate_velocity",
+            self.calculate_velocity,
+            query,
+        ) or {
+            "academic_velocity":           "stable",
+            "academic_growth_rate":        0.0,
+            "startup_velocity":            "stable",
+            "news_velocity":               "stable",
+            "overall_velocity":            "stable",
+            "score_growth_per_month":      0.0,
+            "estimated_next_stage_months": None,
+            "velocity_summary":            "Insufficient history to calculate velocity.",
+        }
+
         finished = datetime.now(timezone.utc).isoformat()
         logger.info(
-            "run_full_pipeline DONE | query=%r | stage=%d | score=%.1f | finished %s",
-            query, scores["overall_stage"], scores["overall_score"], finished,
+            "run_full_pipeline DONE | query=%r | stage=%d | score=%.1f | "
+            "velocity=%s | finished %s",
+            query, scores["overall_stage"], scores["overall_score"],
+            velocity["overall_velocity"], finished,
         )
 
         return {
@@ -739,6 +1028,7 @@ class DataEmbedder:
             "cleaned":      cleaned,
             "storage":      storage,
             "scores":       scores,
+            "velocity":     velocity,
             "score_row_id": score_row_id,
         }
 

@@ -259,7 +259,7 @@ class DataFetcher:
 
     # ── Stage 2: Developer / Startup ─────────────────────────────────────────
 
-    def fetch_startup_signals(self, query: str) -> dict:
+    def fetch_startup_signals(self, query: str, progress_callback=None) -> dict:
         """
         Stage 2 — Developer community and early startup signals.
 
@@ -278,7 +278,12 @@ class DataFetcher:
         """
         logger.info("fetch_startup_signals | query=%r", query)
 
+        def _cb(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+
         # ── GitHub ───────────────────────────────────────────────────────────
+        _cb("Searching GitHub repositories...")
         github_results = self._run_tool(
             "github_search_repositories",
             search_github_repos,
@@ -318,6 +323,7 @@ class DataFetcher:
         logger.info("[producthunt] %d posts returned | %d stored", len(ph_results), stored)
 
         # ── YC Scraper ───────────────────────────────────────────────────────
+        _cb("Scraping YC companies...")
         yc_results = self._run_tool(
             "yc_search_companies",
             search_yc_companies,
@@ -520,7 +526,7 @@ class DataFetcher:
 
     # ── Full pipeline fetch ───────────────────────────────────────────────────
 
-    def fetch_all(self, query: str) -> dict:
+    def fetch_all(self, query: str, progress_callback=None) -> dict:
         """
         Runs all five stage fetchers in sequence and returns a unified result.
 
@@ -536,7 +542,10 @@ class DataFetcher:
              concurrent ones.
 
         Args:
-            query : Technology or concept to fetch signals for.
+            query             : Technology or concept to fetch signals for.
+            progress_callback : Optional callable(str) invoked before each
+                                stage fetch with a human-readable status message.
+                                Used by the streaming API to relay progress to the UI.
 
         Returns:
             dict:
@@ -552,16 +561,24 @@ class DataFetcher:
         if not query or not query.strip():
             raise ValueError("query must be a non-empty string")
 
+        def _cb(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+
         query = query.strip()
         fetched_at = datetime.now(timezone.utc).isoformat()
         logger.info("=" * 60)
         logger.info("fetch_all | query=%r | started at %s", query, fetched_at)
         logger.info("=" * 60)
 
+        _cb("Fetching academic papers...")
         academic   = self.fetch_academic(query)
-        startup    = self.fetch_startup_signals(query)
+        startup    = self.fetch_startup_signals(query, progress_callback=progress_callback)
+        _cb("Fetching news signals...")
         investment = self.fetch_investment_signals(query)
+        _cb("Searching patent filings...")
         bigtech    = self.fetch_bigtech_signals(query)
+        _cb("Checking mainstream signals...")
         mainstream = self.fetch_mainstream_signals(query)
 
         # ── Summary counts ────────────────────────────────────────────────────

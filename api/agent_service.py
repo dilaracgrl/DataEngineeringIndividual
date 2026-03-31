@@ -34,13 +34,13 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -61,6 +61,7 @@ load_dotenv(_ROOT / ".env")
 
 from agents.researcher import ResearcherAgent, TOOL_DEFINITIONS as RESEARCHER_TOOLS
 from agents.analyst import AnalystAgent, _sse
+from database.mongo_client import MongoDBClient
 from lineage.tracker import LineageTracker
 
 # ---------------------------------------------------------------------------
@@ -99,8 +100,11 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 _researcher: Optional[ResearcherAgent] = None
-_analyst: Optional[AnalystAgent] = None
-_lineage: Optional[LineageTracker] = None
+_analyst:    Optional[AnalystAgent]    = None
+_lineage:    Optional[LineageTracker]  = None
+_mongo:      Optional[MongoDBClient]   = None
+
+_CACHE_TTL_HOURS = 24
 
 
 def _get_researcher() -> ResearcherAgent:
@@ -122,6 +126,61 @@ def _get_lineage() -> LineageTracker:
     if _lineage is None:
         _lineage = LineageTracker()
     return _lineage
+
+
+def _get_mongo() -> MongoDBClient:
+    global _mongo
+    if _mongo is None:
+        _mongo = MongoDBClient()
+    return _mongo
+
+
+# ---------------------------------------------------------------------------
+# Analysis result cache helpers (24-hour TTL, stored in MongoDB)
+# ---------------------------------------------------------------------------
+
+def _cache_key(query: str) -> str:
+    """Normalise query to a stable cache key."""
+    return query.strip().lower()
+
+
+def _cache_get(query: str) -> Optional[dict]:
+    """Return a cached analysis result if it exists and is < 24 h old."""
+    try:
+        coll = _get_mongo().get_analysis_cache()
+        doc  = coll.find_one({"query": _cache_key(query)})
+        if not doc:
+            return None
+        cached_at = datetime.fromisoformat(doc["cached_at"])
+        if datetime.now(timezone.utc) - cached_at > timedelta(hours=_CACHE_TTL_HOURS):
+            return None
+        return doc
+    except Exception as exc:
+        logger.warning("Cache read failed: %s", exc)
+        return None
+
+
+def _cache_put(query: str, scores: dict, assessment: dict,
+               velocity: dict, raw_critique: str, logged_at: str) -> None:
+    """Upsert an analysis result into the cache."""
+    try:
+        coll = _get_mongo().get_analysis_cache()
+        coll.replace_one(
+            {"query": _cache_key(query)},
+            {
+                "query":       _cache_key(query),
+                "cached_at":   datetime.now(timezone.utc).isoformat(),
+                "scores":      scores,
+                "assessment":  assessment,
+                "velocity":    velocity,
+                "raw_critique": raw_critique,
+                "logged_at":   logged_at,
+            },
+            upsert=True,
+        )
+        logger.info("Cached analysis result for query=%r", query)
+    except Exception as exc:
+        logger.warning("Cache write failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +209,21 @@ class GraphContextRequest(BaseModel):
 class ToolCallRequest(BaseModel):
     tool_name: str
     params: dict = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard UI
+# ---------------------------------------------------------------------------
+
+_UI_FILE = _ROOT / "ui" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def dashboard() -> FileResponse:
+    """Serve the single-page intelligence dashboard."""
+    if not _UI_FILE.exists():
+        raise HTTPException(status_code=404, detail="ui/index.html not found")
+    return FileResponse(str(_UI_FILE), media_type="text/html")
 
 
 # ---------------------------------------------------------------------------
@@ -312,20 +386,80 @@ def analyse_stream(req: QueryRequest) -> StreamingResponse:
     """
     Full pipeline + Claude reasoning — SSE streaming response.
 
+    Checks the 24-hour MongoDB cache before running the pipeline.
+    On a cache hit the full result is returned instantly with
+    "cached": true in the complete event.
+
     Event stream format:
-        data: {"event": "status",   "message": "..."}
+        data: {"event": "status",   "message": "...", "elapsed": 1.2}
         data: {"event": "scores",   "scores": {...}}
         data: {"event": "token",    "token": "..."}
-        data: {"event": "complete", "assessment": {...}, "prov": {...}}
-
-    The client should buffer tokens until the "complete" event, then
-    render the final assessment JSON.
+        data: {"event": "complete", "assessment": {...}, "cached": false, ...}
+        data: {"event": "error",    "message": "..."}
     """
-    analyst = _get_analyst()
+    analyst  = _get_analyst()
+    query    = req.query
+    t0       = datetime.now(timezone.utc)
+
+    def _elapsed() -> float:
+        return round((datetime.now(timezone.utc) - t0).total_seconds(), 1)
 
     def generate() -> Iterator[str]:
+        # ── Cache check ──────────────────────────────────────────────────────
+        cached = _cache_get(query)
+        if cached:
+            logger.info("Cache hit for query=%r", query)
+            yield _sse({"event": "status", "message": "Returning cached result (< 24 h old)...", "elapsed": _elapsed()})
+            scores = cached.get("scores", {})
+            yield _sse({
+                "event":   "scores",
+                "scores":  scores,
+                "message": f"Stage {scores.get('overall_stage')} (cached)",
+            })
+            yield _sse({
+                "event":        "complete",
+                "query":        query,
+                "assessment":   cached.get("assessment", {}),
+                "velocity":     cached.get("velocity", {}),
+                "raw_critique": cached.get("raw_critique", ""),
+                "prov":         None,
+                "logged_at":    cached.get("logged_at", ""),
+                "cached":       True,
+                "cached_at":    cached.get("cached_at", ""),
+                "elapsed":      _elapsed(),
+            })
+            return
+
+        # ── Fresh run ────────────────────────────────────────────────────────
         try:
-            yield from analyst.analyse_stream(req.query)
+            scores_snapshot: dict  = {}
+            complete_payload: dict = {}
+
+            for chunk in analyst.analyse_stream(query):
+                # Intercept scores and complete events to cache after streaming
+                if chunk.startswith("data: "):
+                    try:
+                        payload = json.loads(chunk[6:])
+                        ev = payload.get("event", "")
+                        if ev == "scores":
+                            scores_snapshot = payload.get("scores", {})
+                        elif ev == "complete":
+                            complete_payload = payload
+                    except Exception:
+                        pass
+                yield chunk
+
+            # Persist to cache once the stream is complete
+            if complete_payload:
+                _cache_put(
+                    query        = query,
+                    scores       = scores_snapshot,
+                    assessment   = complete_payload.get("assessment", {}),
+                    velocity     = complete_payload.get("velocity", {}),
+                    raw_critique = complete_payload.get("raw_critique", ""),
+                    logged_at    = complete_payload.get("logged_at", ""),
+                )
+
         except EnvironmentError as exc:
             yield _sse({"event": "error", "message": str(exc)})
         except Exception as exc:

@@ -214,6 +214,23 @@ class MongoDBClient:
             )
         return self._get_db()[collection]
 
+    def get_analysis_cache(self):
+        """
+        Returns the analysis_cache collection for 24-hour result caching.
+
+        This collection sits outside the pipeline data collections (VALID_COLLECTIONS)
+        because it stores API-level service results, not pipeline documents.
+        Schema per document:
+            query      (str)  : Normalised query string — used as the upsert key.
+            cached_at  (str)  : ISO 8601 UTC timestamp of when the result was cached.
+            scores     (dict) : Pipeline scores dict (for the scores SSE event).
+            assessment (dict) : Merged analyst + critique assessment.
+            velocity   (dict) : Velocity analysis dict.
+            raw_critique (str): Raw text of the self-critique Claude call.
+            logged_at  (str)  : Timestamp from the original analyse() run.
+        """
+        return self._get_db()["analysis_cache"]
+
     def close(self) -> None:
         """Closes the MongoDB connection and releases the connection pool."""
         if self._client is not None:

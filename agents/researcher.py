@@ -240,7 +240,7 @@ class ResearcherAgent:
     # Tool implementations
     # ------------------------------------------------------------------
 
-    def run_pipeline(self, query: str, force_refresh: bool = False) -> dict:
+    def run_pipeline(self, query: str, force_refresh: bool = False, progress_callback=None) -> dict:
         """
         Full fetch → clean → embed → score pipeline.
 
@@ -249,7 +249,7 @@ class ResearcherAgent:
         logger.info("run_pipeline: query=%r", query)
         started = datetime.now(timezone.utc).isoformat()
 
-        result = self._embedder.run_full_pipeline(query)
+        result = self._embedder.run_full_pipeline(query, progress_callback=progress_callback)
 
         ended = datetime.now(timezone.utc).isoformat()
         prov = self._lineage.record_query(
@@ -375,7 +375,7 @@ class ResearcherAgent:
     # Compound research method (used by the Analyst)
     # ------------------------------------------------------------------
 
-    def full_research(self, query: str) -> dict:
+    def full_research(self, query: str, progress_callback=None) -> dict:
         """
         Run pipeline + RAG + graph in one call.
 
@@ -383,10 +383,16 @@ class ResearcherAgent:
         a ResearchResult dict containing all evidence layers needed for
         stage assessment and narrative generation.
 
+        Args:
+            query             : Technology or concept to research.
+            progress_callback : Optional callable(str) for streaming status
+                                messages to the UI during the pipeline run.
+
         Returns:
             {
                 "query": str,
                 "scores": dict,           # 10 per-tool scores + overall
+                "velocity": dict,         # acceleration signals + next-stage estimate
                 "rag_papers": list[dict], # top semantic matches
                 "rag_articles": list[dict],
                 "graph": dict,            # tech graph from Neo4j
@@ -399,12 +405,19 @@ class ResearcherAgent:
         """
         logger.info("full_research: query=%r", query)
 
-        pipeline_result = self.run_pipeline(query)
+        def _cb(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+
+        pipeline_result = self.run_pipeline(query, progress_callback=progress_callback)
         scores = pipeline_result.get("scores", {})
+        velocity = pipeline_result.get("velocity", {})
         raw_summary = pipeline_result.get("raw", {}).get("summary", {})
 
+        _cb("Running semantic search...")
         rag_papers = self.semantic_search(query, n_results=5, collection="papers")
         rag_articles = self.semantic_search(query, n_results=5, collection="articles")
+        _cb("Querying knowledge graph...")
         graph_data = self.graph_context(query)
         timeline = self.get_timeline(query)
         history = self.get_trend_history(query, limit=5)
@@ -412,6 +425,7 @@ class ResearcherAgent:
         return {
             "query": query,
             "scores": scores,
+            "velocity": velocity,
             "rag_papers": rag_papers["results"],
             "rag_articles": rag_articles["results"],
             "graph": graph_data["graph"],
