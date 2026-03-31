@@ -73,6 +73,7 @@ from pipeline.cleaner  import DataCleaner
 from database.vector_store  import VectorStore
 from database.graph_client  import GraphClient
 from database.sqlite_client import SQLiteClient
+from database.mongo_client  import MongoDBClient
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -197,17 +198,19 @@ class DataEmbedder:
 
     def __init__(
         self,
-        fetcher:      DataFetcher  | None = None,
-        cleaner:      DataCleaner  | None = None,
-        vector_store: VectorStore  | None = None,
-        graph_client: GraphClient  | None = None,
-        sqlite_client: SQLiteClient | None = None,
+        fetcher:       DataFetcher   | None = None,
+        cleaner:       DataCleaner   | None = None,
+        vector_store:  VectorStore   | None = None,
+        graph_client:  GraphClient   | None = None,
+        sqlite_client: SQLiteClient  | None = None,
+        mongo_client:  MongoDBClient | None = None,
     ) -> None:
         self._fetcher = fetcher       or DataFetcher()
         self._cleaner = cleaner       or DataCleaner()
         self._vs      = vector_store  or VectorStore()
         self._graph   = graph_client  or GraphClient()
         self._sqlite  = sqlite_client or SQLiteClient()
+        self._mongo   = mongo_client  or MongoDBClient()
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -465,7 +468,7 @@ class DataEmbedder:
 
     # ── 2. Scoring layer ─────────────────────────────────────────────────────
 
-    def compute_stage_scores(self, cleaned_data: dict) -> dict:
+    def compute_stage_scores(self, cleaned_data: dict, query: str = "") -> dict:
         """
         Analyses cleaned data and returns a complete scores dict.
 
@@ -477,6 +480,8 @@ class DataEmbedder:
 
         Args:
             cleaned_data : Output of DataCleaner.clean_all().
+            query        : Original search query — used to load cached patents
+                           from MongoDB when the current fetch returned nothing.
 
         Returns:
             dict with keys matching the trend_scores SQLite table columns.
@@ -486,6 +491,22 @@ class DataEmbedder:
         articles   = cleaned_data.get("investment", [])
         patents    = cleaned_data.get("bigtech",    [])
         mainstream = cleaned_data.get("mainstream", {})
+
+        # ── Patent fallback: if the current fetch returned nothing (PatentsView
+        # down, both fallbacks blocked), score using previously-stored patents
+        # from MongoDB so Stage 4 isn't silently zeroed on API outages.
+        if not patents and query:
+            try:
+                stored = self._mongo.find_by_query("patents", query, limit=20)
+                if stored:
+                    patents = self._cleaner.clean_patents(stored)
+                    logger.info(
+                        "patents | API fetch empty — scoring with %d cached patents "
+                        "from MongoDB for query=%r",
+                        len(patents), query,
+                    )
+            except Exception as exc:
+                logger.warning("patents | MongoDB cache fallback failed: %s", exc)
 
         # ── Split by source ───────────────────────────────────────────────────
         arxiv_papers = [p for p in papers    if p.get("source") == "arxiv"]
@@ -694,7 +715,7 @@ class DataEmbedder:
         storage = self.embed_and_store(cleaned, query)
 
         # 4. Score
-        scores = self.compute_stage_scores(cleaned)
+        scores = self.compute_stage_scores(cleaned, query=query)
 
         # 5. Persist scores to SQLite
         score_row_id = self._safe(

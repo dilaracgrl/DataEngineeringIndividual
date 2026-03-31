@@ -59,7 +59,11 @@ logger = logging.getLogger("patents_tool")
 
 _BASE_URL = "https://search.patentsview.org/api/v1/patent/"
 _GOOGLE_PATENTS_XHR = "https://patents.google.com/xhr/query"
-# Google intermittently returns 503; browser-like UA reduces blocks.
+# USPTO full-text search — the Elasticsearch backend powering the official
+# USPTO patent search website (https://www.uspto.gov/patents/search).
+# No API key required; returns standard ES JSON with hits._source.
+_USPTO_EFTS = "https://efts.uspto.gov/LATEST/search-index"
+# Browser-like UA reduces blocks on Google and USPTO endpoints.
 _GOOGLE_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -177,14 +181,21 @@ def _search_patents_google_patents(
                 raw = resp.read()
             break
         except urllib.error.HTTPError as e:
-            if e.code in (502, 503, 504) and attempt < max_attempts - 1:
+            if e.code in (429, 502, 503, 504) and attempt < max_attempts - 1:
+                # 429 = rate-limited; back off with exponential delay
                 wait = min(30.0, 2.5 * (2 ** attempt))
                 logger.warning(
                     "Google Patents HTTP %s — retrying in %.1fs (%d/%d)",
-                    e.code,
-                    wait,
-                    attempt + 1,
-                    max_attempts,
+                    e.code, wait, attempt + 1, max_attempts,
+                )
+                time.sleep(wait)
+                continue
+            if e.code == 403 and attempt < max_attempts - 1:
+                # 403 = bot detection; longer linear back-off before retrying
+                wait = min(60.0, 15.0 * (attempt + 1))
+                logger.warning(
+                    "Google Patents HTTP 403 (bot detection) — retrying in %.1fs (%d/%d)",
+                    wait, attempt + 1, max_attempts,
                 )
                 time.sleep(wait)
                 continue
@@ -236,6 +247,100 @@ def _search_patents_google_patents(
     return patents
 
 
+def _search_patents_uspo_efts(
+    query: str,
+    max_results: int,
+    date_from: str | None,
+    fetched_at: str,
+    lineage: dict,
+) -> list[dict]:
+    """
+    Second fallback: queries the USPTO's full-text Elasticsearch backend
+    (efts.uspto.gov) — the same index that powers the official USPTO patent
+    search website.  No API key required.
+
+    Field mapping from EFTS _source → our schema:
+        patentNumber           → patent_id
+        patentTitle            → title
+        grantDate              → date
+        abstractText           → abstract
+        assigneeEntityName     → assignee_orgs (single string, wrapped in list)
+        inventorNameArrayText  → inventor_names (list of strings)
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    params: dict = {
+        "query": f'patentTitle:("{query}")',
+        "hits.hits._source.patentNumber": "true",
+        "hits.hits._source.patentTitle": "true",
+        "hits.hits._source.grantDate": "true",
+        "hits.hits._source.abstractText": "true",
+        "hits.hits._source.assigneeEntityName": "true",
+        "hits.hits._source.inventorNameArrayText": "true",
+    }
+    if date_from:
+        params["dateRange"] = "custom"
+        params["startDate"] = date_from[:10]
+        params["endDate"] = today
+
+    url = f"{_USPTO_EFTS}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _GOOGLE_UA,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        logger.error("USPTO EFTS HTTP error %d: %s", e.code, e.reason)
+        raise RuntimeError(f"USPTO EFTS returned HTTP {e.code}: {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error reaching USPTO EFTS: {e.reason}") from e
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"USPTO EFTS returned invalid JSON: {e}") from e
+
+    hits = data.get("hits", {}).get("hits", [])
+    patents: list[dict] = []
+    for hit in hits:
+        src = hit.get("_source") or {}
+        patent_id = src.get("patentNumber", "")
+        title = _strip_html(src.get("patentTitle", ""))
+        date = src.get("grantDate", "")
+        abstract = _strip_html(src.get("abstractText", ""))
+        assignee = src.get("assigneeEntityName", "")
+        inventors = src.get("inventorNameArrayText") or []
+
+        if not title:
+            continue
+        if date_from and date and len(date) >= 10 and len(date_from) >= 10:
+            if date[:10] < date_from[:10]:
+                continue
+
+        patents.append({
+            "patent_id":      patent_id,
+            "title":          title,
+            "date":           date,
+            "abstract":       abstract,
+            "patent_type":    "",
+            "assignee_orgs":  [assignee] if assignee else [],
+            "inventor_names": inventors if isinstance(inventors, list) else [inventors],
+            "source":         "uspto_efts",
+            "fetched_at":     fetched_at,
+            "lineage":        lineage,
+        })
+        if len(patents) >= max_results:
+            break
+
+    logger.info("USPTO EFTS returned %d patents for query=%r", len(patents), query)
+    return patents
+
+
 def _patentsview_unavailable(body: bytes) -> bool:
     if not body:
         return False
@@ -249,6 +354,50 @@ def _patentsview_unavailable(body: bytes) -> bool:
     return "migrating" in msg or "open data portal" in msg or "discontinued" in str(
         err.get("reason", "")
     ).lower()
+
+
+# ---------------------------------------------------------------------------
+# Fallback chain helper
+# ---------------------------------------------------------------------------
+
+def _patents_fallback_chain(
+    query: str,
+    max_results: int,
+    date_from: str | None,
+    fetched_at: str,
+    lineage: dict,
+) -> list[dict]:
+    """
+    Try Google Patents, then USPTO EFTS.  Returns the first non-empty result.
+    Raises RuntimeError only if both sources fail.
+    """
+    # 1. Google Patents XHR
+    try:
+        results = _search_patents_google_patents(
+            query, max_results, date_from, fetched_at, lineage
+        )
+        if results:
+            logger.info("Fallback: Google Patents returned %d patents", len(results))
+            return results
+        logger.warning("Google Patents returned 0 results — trying USPTO EFTS")
+    except RuntimeError as e:
+        logger.warning("Google Patents fallback failed (%s) — trying USPTO EFTS", e)
+
+    # 2. USPTO EFTS (efts.uspto.gov)
+    try:
+        results = _search_patents_uspo_efts(
+            query, max_results, date_from, fetched_at, lineage
+        )
+        if results:
+            logger.info("Fallback: USPTO EFTS returned %d patents", len(results))
+            return results
+        logger.warning("USPTO EFTS returned 0 results for query=%r", query)
+        return []
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"All patent sources failed. PatentsView → Google Patents → USPTO EFTS. "
+            f"Last error: {e}"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +485,10 @@ def search_patents(
             err_body = b""
         if e.code == 410 or _patentsview_unavailable(err_body):
             logger.warning(
-                "PatentsView unavailable (HTTP %s) — using Google Patents fallback",
+                "PatentsView unavailable (HTTP %s) — trying Google Patents then USPTO EFTS",
                 e.code,
             )
-            return _search_patents_google_patents(
-                query, max_results, date_from, fetched_at, lineage
-            )
+            return _patents_fallback_chain(query, max_results, date_from, fetched_at, lineage)
         logger.error("PatentsView HTTP error %d: %s", e.code, e.reason)
         raise RuntimeError(
             f"PatentsView API returned HTTP {e.code}: {e.reason}"
@@ -359,10 +506,8 @@ def search_patents(
         raise RuntimeError(f"PatentsView returned invalid JSON: {e}") from e
 
     if _patentsview_unavailable(raw):
-        logger.warning("PatentsView returned migration/discontinued payload — Google Patents fallback")
-        return _search_patents_google_patents(
-            query, max_results, date_from, fetched_at, lineage
-        )
+        logger.warning("PatentsView returned migration/discontinued payload — fallback chain")
+        return _patents_fallback_chain(query, max_results, date_from, fetched_at, lineage)
 
     raw_patents = data.get("patents") or []
 
