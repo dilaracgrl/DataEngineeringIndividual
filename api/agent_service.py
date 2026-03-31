@@ -470,6 +470,48 @@ def analyse_stream(req: QueryRequest) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# Monitoring alerts endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/alerts", tags=["Monitoring"])
+def get_alerts(limit: int = Query(20, ge=1, le=200)) -> dict:
+    """
+    Returns the most recent monitoring alerts across all watchlist technologies.
+
+    Alerts are written by scripts/monitor.py on each scheduled run.
+    Two types:
+      STAGE_TRANSITION   — overall pipeline stage changed
+      SIGNIFICANT_CHANGE — overall score moved > 15 points
+    """
+    sqlite = _get_lineage()._sqlite if hasattr(_get_lineage(), "_sqlite") \
+        else __import__("database.sqlite_client", fromlist=["SQLiteClient"]).SQLiteClient()
+    try:
+        from database.sqlite_client import SQLiteClient as _SC
+        alerts = _SC().get_alerts(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"alerts": alerts, "count": len(alerts)}
+
+
+@app.get("/alerts/{technology}", tags=["Monitoring"])
+def get_alerts_for_technology(technology: str) -> dict:
+    """
+    Returns all monitoring alerts for a specific technology name.
+
+    URL-encode spaces: /alerts/quantum%20computing
+    """
+    try:
+        from database.sqlite_client import SQLiteClient as _SC
+        alerts = _SC().get_alerts_for_technology(technology)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"technology": technology, "alerts": alerts, "count": len(alerts)}
+
+
+# ---------------------------------------------------------------------------
 # Lineage endpoint
 # ---------------------------------------------------------------------------
 

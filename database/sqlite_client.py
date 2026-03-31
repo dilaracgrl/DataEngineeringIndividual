@@ -190,6 +190,37 @@ CREATE TABLE IF NOT EXISTS technology_timeline (
 
 CREATE INDEX IF NOT EXISTS idx_timeline_technology
     ON technology_timeline (technology, stage);
+
+
+-- ── monitoring_alerts ─────────────────────────────────────────────────────
+-- One row per alert fired by the scheduled monitoring system.
+-- Two alert types are currently defined:
+--   STAGE_TRANSITION   — overall_stage changed between two consecutive runs
+--   SIGNIFICANT_CHANGE — overall_score moved by more than 15 points
+--
+-- previous_stage / new_stage are NULL for SIGNIFICANT_CHANGE-only alerts.
+-- previous_score / new_score are always populated.
+--
+-- This table is the permanent audit trail for the watchlist monitor.
+-- It answers: "When was the first time quantum computing crossed Stage 4?"
+-- and "How many score spikes has neuromorphic computing had?"
+CREATE TABLE IF NOT EXISTS monitoring_alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    technology      TEXT    NOT NULL,
+    alert_type      TEXT    NOT NULL,     -- 'STAGE_TRANSITION' | 'SIGNIFICANT_CHANGE'
+    previous_stage  INTEGER,              -- NULL for score-only alerts
+    new_stage       INTEGER,              -- NULL for score-only alerts
+    previous_score  REAL,
+    new_score       REAL,
+    timestamp       TEXT    NOT NULL,     -- ISO 8601 UTC
+    message         TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitoring_alerts_technology
+    ON monitoring_alerts (technology, timestamp DESC);
+
+CREATE INDEX IF NOT EXISTS idx_monitoring_alerts_type
+    ON monitoring_alerts (alert_type, timestamp DESC);
 """
 
 
@@ -587,6 +618,159 @@ class SQLiteClient:
 
         logger.info(
             "get_technology_timeline | technology=%r | stages_found=%d",
+            technology, len(rows),
+        )
+        return rows
+
+    # ── Monitoring alerts ─────────────────────────────────────────────────────
+
+    def save_alert(
+        self,
+        technology: str,
+        alert_type: str,
+        prev_stage: int | None,
+        new_stage: int | None,
+        prev_score: float | None,
+        new_score: float | None,
+        message: str = "",
+    ) -> int:
+        """
+        Persists a monitoring alert to the monitoring_alerts table.
+
+        Called by scripts/monitor.py whenever a stage transition or
+        significant score change is detected on the watchlist.
+
+        Args:
+            technology : Technology name, e.g. "quantum computing".
+            alert_type : "STAGE_TRANSITION" | "SIGNIFICANT_CHANGE".
+            prev_stage : Stage integer from the previous run (None for score-only).
+            new_stage  : Stage integer from the current run  (None for score-only).
+            prev_score : overall_score from the previous run.
+            new_score  : overall_score from the current run.
+            message    : Human-readable description of the alert.
+
+        Returns:
+            The rowid of the inserted alert row.
+        """
+        if not technology or not technology.strip():
+            raise ValueError("technology must be a non-empty string")
+        if alert_type not in ("STAGE_TRANSITION", "SIGNIFICANT_CHANGE"):
+            raise ValueError(
+                f"alert_type must be STAGE_TRANSITION or SIGNIFICANT_CHANGE, "
+                f"got {alert_type!r}"
+            )
+
+        self._ensure_schema()
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO monitoring_alerts
+                        (technology, alert_type, previous_stage, new_stage,
+                         previous_score, new_score, timestamp, message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        technology.strip(), alert_type,
+                        prev_stage, new_stage,
+                        prev_score, new_score,
+                        timestamp, message,
+                    ],
+                )
+                rowid = cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error("save_alert failed for technology=%r: %s", technology, e)
+            raise RuntimeError(f"SQLite write error in save_alert: {e}") from e
+
+        logger.info(
+            "save_alert | technology=%r | type=%s | stage %s→%s | "
+            "score %.1f→%.1f | rowid=%d",
+            technology, alert_type,
+            prev_stage, new_stage,
+            prev_score or 0.0, new_score or 0.0,
+            rowid,
+        )
+        return rowid
+
+    def get_alerts(self, limit: int = 20) -> list[dict]:
+        """
+        Returns the most recent monitoring alerts across all technologies,
+        newest first.
+
+        Args:
+            limit : Maximum rows to return (capped at 200).
+
+        Returns:
+            List of dicts with all monitoring_alerts columns.
+        """
+        limit = max(1, min(limit, 200))
+        self._ensure_schema()
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT id, technology, alert_type,
+                           previous_stage, new_stage,
+                           previous_score, new_score,
+                           timestamp, message
+                    FROM   monitoring_alerts
+                    ORDER  BY timestamp DESC
+                    LIMIT  ?
+                    """,
+                    [limit],
+                )
+                rows = [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error("get_alerts failed: %s", e)
+            raise RuntimeError(f"SQLite read error in get_alerts: {e}") from e
+
+        logger.info("get_alerts | rows_returned=%d", len(rows))
+        return rows
+
+    def get_alerts_for_technology(self, technology: str) -> list[dict]:
+        """
+        Returns all monitoring alerts for a specific technology, newest first.
+
+        Args:
+            technology : Technology name to filter on (exact match).
+
+        Returns:
+            List of dicts with all monitoring_alerts columns, or [] if none.
+        """
+        if not technology or not technology.strip():
+            raise ValueError("technology must be a non-empty string")
+
+        self._ensure_schema()
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    SELECT id, technology, alert_type,
+                           previous_stage, new_stage,
+                           previous_score, new_score,
+                           timestamp, message
+                    FROM   monitoring_alerts
+                    WHERE  technology = ?
+                    ORDER  BY timestamp DESC
+                    """,
+                    [technology.strip()],
+                )
+                rows = [dict(row) for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(
+                "get_alerts_for_technology failed for technology=%r: %s",
+                technology, e,
+            )
+            raise RuntimeError(
+                f"SQLite read error in get_alerts_for_technology: {e}"
+            ) from e
+
+        logger.info(
+            "get_alerts_for_technology | technology=%r | rows_returned=%d",
             technology, len(rows),
         )
         return rows

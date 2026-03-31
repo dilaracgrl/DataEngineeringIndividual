@@ -555,6 +555,62 @@
     }
     .conflict-item::before { content: '⚠'; flex-shrink: 0; }
 
+    /* ── Alerts panel ───────────────────────────────────────────────── */
+    .alerts-wrap {
+      margin-top: 32px;
+      border-top: 1px solid var(--border);
+      padding-top: 24px;
+    }
+    .alerts-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .alerts-refresh {
+      background: none;
+      border: 1px solid var(--border-hi);
+      color: var(--text-mid);
+      font-family: var(--font);
+      font-size: 10px;
+      padding: 3px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .alerts-refresh:hover { border-color: var(--accent); color: var(--accent); }
+    .alert-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px 12px;
+      align-items: start;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      margin-bottom: 6px;
+      font-size: 11px;
+    }
+    .alert-item.stage-transition { border-left: 3px solid var(--yellow); }
+    .alert-item.significant-change { border-left: 3px solid var(--accent); }
+    .alert-type-badge {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 2px 7px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    .alert-type-badge.stage-transition { background: #2a2200; color: var(--yellow); }
+    .alert-type-badge.significant-change { background: var(--accent-dim); color: var(--accent); }
+    .alert-tech { color: var(--text); font-weight: 700; }
+    .alert-detail { color: var(--text-mid); grid-column: 2; }
+    .alert-ts { color: var(--text-dim); font-size: 10px; white-space: nowrap; text-align: right; }
+    .alerts-empty { color: var(--text-dim); font-size: 11px; padding: 8px 0; }
+
     /* ── Error toast ────────────────────────────────────────────────── */
     .error-toast {
       display: none;
@@ -682,6 +738,15 @@
   <div class="conflicts-wrap" id="conflictsWrap">
     <div class="section-label">Conflicting Signals</div>
     <div id="conflictsList"></div>
+  </div>
+
+  <!-- Monitoring alerts -->
+  <div class="alerts-wrap">
+    <div class="alerts-header">
+      <div class="section-label" style="margin-bottom:0">Recent Monitoring Alerts</div>
+      <button class="alerts-refresh" onclick="loadAlerts()">Refresh</button>
+    </div>
+    <div id="alertsList"><span class="alerts-empty">Loading alerts…</span></div>
   </div>
 
 </div><!-- .shell -->
@@ -1158,13 +1223,67 @@
       .replace(/"/g, '&quot;');
   }
 
+  // ── Monitoring alerts ─────────────────────────────────────────────────────
+  function fmtAlertTs(ts) {
+    if (!ts) return '';
+    try {
+      const d = new Date(ts);
+      return d.toLocaleString(undefined, {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+    } catch (_) { return ts; }
+  }
+
+  function renderAlerts(alerts) {
+    const el = document.getElementById('alertsList');
+    if (!alerts || alerts.length === 0) {
+      el.innerHTML = '<span class="alerts-empty">No alerts yet — run <code>python scripts/monitor.py</code> to populate.</span>';
+      return;
+    }
+    el.innerHTML = alerts.map(a => {
+      const typeKey = (a.alert_type || '').toLowerCase().replace('_', '-');
+      const typeBadge = typeKey === 'stage-transition' ? 'Stage Transition' : 'Significant Change';
+      let detail = escHtml(a.message || '');
+      if (!detail) {
+        if (a.alert_type === 'STAGE_TRANSITION' && a.previous_stage != null && a.new_stage != null) {
+          detail = `Stage ${a.previous_stage} → ${a.new_stage}`;
+        } else if (a.previous_score != null && a.new_score != null) {
+          const delta = (a.new_score - a.previous_score).toFixed(1);
+          const sign  = delta >= 0 ? '+' : '';
+          detail = `Score ${a.previous_score.toFixed(1)} → ${a.new_score.toFixed(1)} (${sign}${delta})`;
+        }
+      }
+      return `<div class="alert-item ${typeKey}">
+        <span class="alert-type-badge ${typeKey}">${typeBadge}</span>
+        <span class="alert-tech">${escHtml(a.technology || '')}</span>
+        <span class="alert-ts">${fmtAlertTs(a.timestamp)}</span>
+        <span class="alert-detail" style="grid-column:1/-1;padding-top:2px;color:var(--text-mid)">${detail}</span>
+      </div>`;
+    }).join('');
+  }
+
+  async function loadAlerts() {
+    const el = document.getElementById('alertsList');
+    el.innerHTML = '<span class="alerts-empty">Loading…</span>';
+    try {
+      const resp = await fetch('/alerts?limit=20');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderAlerts(data.alerts || []);
+    } catch (err) {
+      el.innerHTML = `<span class="alerts-empty" style="color:var(--red)">Could not load alerts: ${escHtml(err.message)}</span>`;
+    }
+  }
+
   // Allow Enter key to trigger analysis
   document.getElementById('queryInput').addEventListener('keydown', e => {
     if (e.key === 'Enter') runAnalysis();
   });
 
-  // Initial pipeline render
+  // Initial pipeline render + alerts load
   buildPipeline();
+  loadAlerts();
 </script>
 </body>
 </html>
