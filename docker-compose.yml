@@ -1,0 +1,98 @@
+# ===========================================================================
+# Technology Pipeline Tracker — Docker Compose
+#
+# Services:
+#   mongo     — Raw document storage (MongoDB 7)
+#   neo4j     — Relationship graph (Neo4j 5 Community)
+#   api       — FastAPI agent service (Researcher + Analyst)
+#
+# Note: ChromaDB and SQLite run in-process inside the API container.
+#       ChromaDB persists to ./database/chroma_db (volume mount).
+#       SQLite persists to ./database/pipeline_tracker.db (volume mount).
+#
+# Usage:
+#   docker-compose up --build          # start everything
+#   docker-compose up mongo neo4j      # start only the databases
+#   docker-compose down -v             # stop and remove volumes
+# ===========================================================================
+
+services:
+
+  # ── MongoDB ──────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: pipeline_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: pipeline_tracker
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Neo4j ────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: pipeline_neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-pipeline123}"
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-pipeline123}", "RETURN 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── FastAPI Agent Service ─────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pipeline_api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override DB URIs to point at Docker service names
+      MONGO_URI: "mongodb://mongo:27017"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      # NEO4J_PASSWORD comes from .env
+      CHROMA_DB_PATH: "database/chroma_db"
+      SQLITE_DB_PATH: "database/pipeline_tracker.db"
+      API_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist ChromaDB and SQLite across container restarts
+      - ./database/chroma_db:/app/database/chroma_db
+      - ./database:/app/database
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  mongo_data:
+  neo4j_data:
+  neo4j_logs:
