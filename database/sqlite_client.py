@@ -147,13 +147,19 @@ CREATE INDEX IF NOT EXISTS idx_trend_scores_query_ts
 -- (compare response claims against sources_used) and usage analytics.
 -- sources_used is stored as a JSON array of tool names, e.g.:
 --   ["arxiv_search", "github_repo_activity", "patents_search"]
+-- model_version records which Claude model produced the response,
+-- populated from the ANTHROPIC_MODEL env var (default: claude-sonnet-4-6).
+-- This closes the model lineage gap: audit queries can now answer
+-- "did the assessment change because the model was upgraded?"
 CREATE TABLE IF NOT EXISTS query_history (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     query          TEXT    NOT NULL,
     timestamp      TEXT    NOT NULL,      -- ISO 8601 UTC
     agent_response TEXT    NOT NULL,      -- full text of the agent's answer
     sources_used   TEXT    NOT NULL       -- JSON array of tool/source names
-                   DEFAULT '[]'
+                   DEFAULT '[]',
+    model_version  TEXT    NOT NULL       -- Claude model ID used for this query
+                   DEFAULT 'claude-sonnet-4-6'
 );
 
 CREATE INDEX IF NOT EXISTS idx_query_history_query
@@ -304,6 +310,16 @@ class SQLiteClient:
             return
         with self._connect() as conn:
             conn.executescript(_DDL)
+            # Migration: add model_version to existing databases that pre-date
+            # this column. ALTER TABLE ADD COLUMN is idempotent here because we
+            # catch the "duplicate column name" error SQLite raises on re-runs.
+            try:
+                conn.execute(
+                    "ALTER TABLE query_history "
+                    "ADD COLUMN model_version TEXT NOT NULL DEFAULT 'claude-sonnet-4-6'"
+                )
+            except Exception:
+                pass  # column already exists — nothing to do
         self._initialised = True
         logger.info("SQLite schema ready at %s", self._db_path)
 
@@ -388,6 +404,7 @@ class SQLiteClient:
         query: str,
         response: str,
         sources: list[str],
+        model_version: str | None = None,
     ) -> int:
         """
         Appends a row to query_history recording a system query and its response.
@@ -400,12 +417,16 @@ class SQLiteClient:
             actually called?
           - Reproducibility: re-running with the same sources should give a
             similar answer.
+          - Model lineage: model_version records which Claude model produced
+            the response so score changes can be correlated with model upgrades.
 
         Args:
-            query    : The user's technology question.
-            response : The agent's full text response.
-            sources  : List of tool/source names used, e.g.
-                       ["arxiv_search", "github_repo_activity"].
+            query         : The user's technology question.
+            response      : The agent's full text response.
+            sources       : List of tool/source names used, e.g.
+                            ["arxiv_search", "github_repo_activity"].
+            model_version : Claude model ID. Defaults to the ANTHROPIC_MODEL
+                            env var, falling back to "claude-sonnet-4-6".
 
         Returns:
             The rowid of the inserted row.
@@ -416,23 +437,35 @@ class SQLiteClient:
         if not query or not query.strip():
             raise ValueError("query must be a non-empty string")
 
+        resolved_model = (
+            model_version
+            or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        )
+
         self._ensure_schema()
         timestamp = datetime.now(timezone.utc).isoformat()
         sources_json = json.dumps(sources if isinstance(sources, list) else [])
 
         sql = """
-            INSERT INTO query_history (query, timestamp, agent_response, sources_used)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO query_history
+                (query, timestamp, agent_response, sources_used, model_version)
+            VALUES (?, ?, ?, ?, ?)
         """
         try:
             with self._connect() as conn:
-                cursor = conn.execute(sql, [query.strip(), timestamp, response, sources_json])
+                cursor = conn.execute(
+                    sql,
+                    [query.strip(), timestamp, response, sources_json, resolved_model],
+                )
                 rowid = cursor.lastrowid
         except sqlite3.Error as e:
             logger.error("log_query failed for query=%r: %s", query, e)
             raise RuntimeError(f"SQLite write error in log_query: {e}") from e
 
-        logger.info("log_query | query=%r | sources=%s | rowid=%d", query, sources, rowid)
+        logger.info(
+            "log_query | query=%r | model=%s | sources=%s | rowid=%d",
+            query, resolved_model, sources, rowid,
+        )
         return rowid
 
     def save_timeline_event(
@@ -879,6 +912,7 @@ if __name__ == "__main__":
                 "TechCrunch coverage shows 12 funding articles in the last 90 days."
             ),
             sources=["arxiv_search", "github_repo_activity", "techcrunch_search_funding"],
+            model_version="claude-sonnet-4-6",
         )
         print(f"Logged query id: {qid}")
 

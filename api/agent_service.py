@@ -74,6 +74,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api.agent_service")
 
+
+def _cors_allowed_origins() -> list[str]:
+    """
+    Comma-separated CORS_ORIGINS env (e.g. ``http://localhost:5173,https://app.example.com``).
+    If unset, allow all origins (``*``) for local development only — set CORS_ORIGINS in production.
+    """
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
@@ -90,7 +102,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restrict in production
+    allow_origins=_cors_allowed_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )

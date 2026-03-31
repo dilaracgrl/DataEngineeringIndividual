@@ -18,6 +18,12 @@ COPY . .
 # Create database directories so volume mounts land in the right place
 RUN mkdir -p database/chroma_db
 
+# Optional: Chromium for Playwright-backed scrapers (TechCrunch, etc.).
+# Uncomment the next two lines to bake browsers into the image (~400MB+).
+# Default: omit — run `playwright install chromium` on the host for full scraper support.
+# RUN playwright install-deps chromium
+# RUN playwright install chromium
+
 # Expose the FastAPI port
 EXPOSE 8000
 

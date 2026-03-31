@@ -342,15 +342,28 @@ def _save_report(report: dict, run_ts: str) -> Path:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run_monitor(watchlist: list[str] = WATCHLIST) -> dict:
+def run_monitor(
+    watchlist: list[str] | None = None,
+    *,
+    score_delta_threshold: float | None = None,
+) -> dict:
     """
     Runs the full monitoring cycle for every technology in watchlist.
 
     Returns the report dict (also saved to disk and summarised to console).
     Can be imported and called programmatically, or run directly.
+
+    Args:
+        watchlist: Defaults to :data:`WATCHLIST` when omitted.
+        score_delta_threshold: Overrides :data:`SCORE_DELTA_THRESHOLD` for this run.
     """
+    global SCORE_DELTA_THRESHOLD
+    if score_delta_threshold is not None:
+        SCORE_DELTA_THRESHOLD = score_delta_threshold
+
+    wl = watchlist if watchlist is not None else WATCHLIST
     run_ts = datetime.now(timezone.utc).isoformat()
-    total  = len(watchlist)
+    total  = len(wl)
 
     print()
     print(f"{_BOLD}{'=' * 52}{_RESET}")
@@ -363,7 +376,7 @@ def run_monitor(watchlist: list[str] = WATCHLIST) -> dict:
     sqlite   = SQLiteClient()
     results: list[TechResult] = []
 
-    for i, tech in enumerate(watchlist, start=1):
+    for i, tech in enumerate(wl, start=1):
         r = _run_one(
             technology = tech,
             embedder   = embedder,
@@ -445,8 +458,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.threshold != SCORE_DELTA_THRESHOLD:
-        SCORE_DELTA_THRESHOLD = args.threshold
-
     watchlist_to_use = args.watchlist if args.watchlist else WATCHLIST
-    run_monitor(watchlist_to_use)
+    run_monitor(
+        watchlist_to_use,
+        score_delta_threshold=args.threshold,
+    )

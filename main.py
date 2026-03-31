@@ -7,6 +7,7 @@ Modes
   analyse    Run a one-shot analysis for a query (CLI)
   pipeline   Run only the data pipeline (no Claude) for a query (CLI)
   lineage    Print the W3C PROV event log for a query (CLI)
+  monitor    Run the scheduled watchlist monitor (pipeline + alerts)
 
 Usage
 ──────
@@ -21,6 +22,10 @@ Usage
 
   # Show lineage for a query
   python main.py lineage "transformer"
+
+  # Watchlist monitor (same as scripts/monitor.py)
+  python main.py monitor
+  python main.py monitor --watchlist "quantum computing" --threshold 20
 
   # Show help
   python main.py --help
@@ -166,6 +171,17 @@ def cmd_lineage(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_monitor(args: argparse.Namespace) -> None:
+    """Run the technology watchlist monitor (see scripts/monitor.py)."""
+    from scripts.monitor import WATCHLIST, run_monitor
+
+    watchlist = args.watchlist if args.watchlist else WATCHLIST
+    run_monitor(
+        watchlist,
+        score_delta_threshold=args.threshold,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -235,6 +251,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_lineage.add_argument("query", help="Query to look up in lineage log")
     p_lineage.add_argument("--limit", type=int, default=50)
 
+    # monitor
+    p_monitor = sub.add_parser(
+        "monitor",
+        help="Run watchlist pipeline monitor (alerts + JSON report under reports/)",
+    )
+    p_monitor.add_argument(
+        "--watchlist",
+        nargs="+",
+        metavar="TECH",
+        default=None,
+        help=(
+            "Override default watchlist. Quote multi-word names: "
+            '--watchlist "quantum computing" "diffusion models"'
+        ),
+    )
+    p_monitor.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Score-change threshold for SIGNIFICANT_CHANGE alerts (default: 15.0)",
+    )
+
     return parser
 
 
@@ -258,5 +296,7 @@ if __name__ == "__main__":
         cmd_pipeline(args)
     elif args.command == "lineage":
         cmd_lineage(args)
+    elif args.command == "monitor":
+        cmd_monitor(args)
     else:
         parser.print_help()

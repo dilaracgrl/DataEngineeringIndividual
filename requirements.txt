@@ -55,5 +55,5 @@ python-dateutil==2.9.0.post0   # flexible date parsing
 
 # ── Dev / optional ───────────────────────────────────────────
 # ipython            # for interactive exploration
-# pytest             # for running tests
+pytest==8.3.4        # run: pytest tests/  (from repo root)
 # pytest-asyncio     # for async FastAPI tests

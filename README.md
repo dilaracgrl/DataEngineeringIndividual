@@ -174,6 +174,12 @@ API docs at         http://localhost:8000/docs
 
 Navigate to **http://localhost:8000** in your browser.
 
+**CORS (production):** By default, all origins are allowed (`*`), which is convenient for local development. For a public deployment, set **`CORS_ORIGINS`** in `.env` to a comma-separated list (no spaces), for example:
+
+```env
+CORS_ORIGINS=http://localhost:8000,https://myapp.example.com
+```
+
 ---
 
 ## Alternative: run everything in Docker
@@ -185,6 +191,8 @@ docker compose up --build
 ```
 
 The API service waits for both databases to be healthy before starting.
+
+**Playwright / Chromium:** The default `Dockerfile` installs the Python `playwright` package but does **not** download browser binaries (to keep the image smaller). Scrapers that need a real browser (for example TechCrunch) should either run the pipeline on the **host** after `playwright install chromium`, or uncomment the optional `playwright install` lines at the bottom of `Dockerfile` and rebuild (larger image).
 
 ---
 
@@ -223,6 +231,10 @@ python main.py pipeline "neuromorphic computing"
 
 # Print the W3C PROV lineage log for a past query
 python main.py lineage "diffusion models"
+
+# Watchlist monitor (pipeline + alerts + report under reports/)
+python main.py monitor
+python main.py monitor --watchlist "quantum computing" --threshold 20
 ```
 
 ---
@@ -232,7 +244,7 @@ python main.py lineage "diffusion models"
 ```
 DataEngineeringIndividual/
 │
-├── main.py                    CLI entry point (serve / analyse / pipeline / lineage)
+├── main.py                    CLI entry point (serve / analyse / pipeline / lineage / monitor)
 ├── requirements.txt           Python dependencies
 ├── Dockerfile                 Python 3.11-slim container for the API service
 ├── docker-compose.yml         MongoDB + Neo4j + API (three-service stack)
@@ -280,10 +292,23 @@ DataEngineeringIndividual/
 ├── lineage/
 │   └── tracker.py             W3C PROV event log — every data access recorded
 │
-└── scripts/
-    ├── validate_env.py        Checks all required keys before startup
-    ├── ping_mongo.py          MongoDB connectivity smoke test
-    └── test_tools.py          Individual tool smoke tests
+├── scripts/
+│   ├── validate_env.py        Checks all required keys before startup
+│   ├── ping_mongo.py          MongoDB connectivity smoke test
+│   ├── test_tools.py          Individual tool smoke tests
+│   └── monitor.py             Watchlist pipeline monitor (also: python main.py monitor)
+│
+└── tests/
+    └── test_api_smoke.py      FastAPI smoke tests (pytest)
+```
+
+---
+
+## Tests
+
+```bash
+# From the repository root (requires pytest in requirements.txt)
+pytest tests/ -q
 ```
 
 ---
