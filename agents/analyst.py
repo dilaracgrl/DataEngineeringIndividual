@@ -99,7 +99,7 @@ def _anthropic_failure_message(exc: anthropic.APIStatusError) -> str:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_MODEL = "claude-sonnet-4-6"
-_MAX_TOKENS = 2048
+_MAX_TOKENS = 4096
 
 
 def _anthropic_model() -> str:
@@ -667,24 +667,39 @@ class AnalystAgent:
                 ln for ln in lines if not ln.startswith("```")
             ).strip()
 
+        # First attempt: direct parse
         try:
             assessment = json.loads(text)
             return assessment
         except json.JSONDecodeError:
-            logger.warning("Claude response was not valid JSON — using fallback")
-            scores = research.get("scores", {})
-            stage = scores.get("overall_stage", 1)
-            return {
-                "confirmed_stage": stage,
-                "stage_label": _STAGE_LABELS.get(stage, "Unknown"),
-                "confidence": "Low",
-                "narrative": raw_text[:500],
-                "evidence_by_stage": {},
-                "conflicting_signals": ["Claude response was not valid JSON."],
-                "next_stage_prediction": {"stage": min(stage + 1, 5), "trigger": "Unknown"},
-                "sources_cited": [],
-                "_parse_error": True,
-            }
+            pass
+
+        # Second attempt: extract the outermost {...} block in case Claude
+        # prefixed or suffixed the JSON with prose despite the prompt instruction
+        start = text.find("{")
+        end   = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                assessment = json.loads(text[start:end + 1])
+                logger.info("_parse_assessment: extracted JSON from mixed-text response")
+                return assessment
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("Claude response was not valid JSON — using fallback")
+        scores = research.get("scores", {})
+        stage = scores.get("overall_stage", 1)
+        return {
+            "confirmed_stage": stage,
+            "stage_label": _STAGE_LABELS.get(stage, "Unknown"),
+            "confidence": "Low",
+            "narrative": raw_text[:500],
+            "evidence_by_stage": {},
+            "conflicting_signals": ["Claude response was not valid JSON."],
+            "next_stage_prediction": {"stage": min(stage + 1, 5), "trigger": "Unknown"},
+            "sources_cited": [],
+            "_parse_error": True,
+        }
 
     def _run_critique(
         self,
@@ -740,25 +755,38 @@ class AnalystAgent:
             lines = text.splitlines()
             text = "\n".join(ln for ln in lines if not ln.startswith("```")).strip()
 
+        def _apply_defaults(c: dict) -> dict:
+            c.setdefault("confidence_score", 50)
+            c.setdefault("reliability", "Medium")
+            c.setdefault("supporting_evidence", [])
+            c.setdefault("contradicting_evidence", [])
+            c.setdefault("unsupported_claims", [])
+            return c
+
         try:
-            critique = json.loads(text)
-            # Ensure all expected keys are present
-            critique.setdefault("confidence_score", 50)
-            critique.setdefault("reliability", "Medium")
-            critique.setdefault("supporting_evidence", [])
-            critique.setdefault("contradicting_evidence", [])
-            critique.setdefault("unsupported_claims", [])
-            return critique
+            return _apply_defaults(json.loads(text))
         except json.JSONDecodeError:
-            logger.warning("Critique response was not valid JSON — using fallback")
-            return {
-                "confidence_score": 50,
-                "reliability": "Medium",
-                "supporting_evidence": [],
-                "contradicting_evidence": [],
-                "unsupported_claims": ["Critique parse failed — raw response not valid JSON."],
-                "_parse_error": True,
-            }
+            pass
+
+        # Fallback: extract outermost {...} block
+        start = text.find("{")
+        end   = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                logger.info("_parse_critique: extracted JSON from mixed-text response")
+                return _apply_defaults(json.loads(text[start:end + 1]))
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("Critique response was not valid JSON — using fallback")
+        return {
+            "confidence_score": 50,
+            "reliability": "Medium",
+            "supporting_evidence": [],
+            "contradicting_evidence": [],
+            "unsupported_claims": ["Critique parse failed — raw response not valid JSON."],
+            "_parse_error": True,
+        }
 
     @staticmethod
     def _fallback_critique() -> dict:

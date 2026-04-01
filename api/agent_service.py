@@ -461,8 +461,10 @@ def analyse_stream(req: QueryRequest) -> StreamingResponse:
                         pass
                 yield chunk
 
-            # Persist to cache once the stream is complete
-            if complete_payload:
+            # Persist to cache only if the assessment parsed cleanly —
+            # never cache a fallback result that contains a parse error.
+            assessment_ok = not complete_payload.get("assessment", {}).get("_parse_error")
+            if complete_payload and assessment_ok:
                 _cache_put(
                     query        = query,
                     scores       = scores_snapshot,
