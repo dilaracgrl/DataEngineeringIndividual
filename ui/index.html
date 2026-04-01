@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Technology Pipeline Tracker</title>
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #080b0f;
+      --surface:     #0d1117;
+      --surface2:    #131920;
+      --border:      #1e2733;
+      --border-hi:   #2a3a4a;
+      --text:        #c9d1d9;
+      --text-dim:    #586069;
+      --text-mid:    #8b949e;
+      --accent:      #00d4aa;
+      --accent-dim:  #00d4aa22;
+      --accent-glow: #00d4aa55;
+      --green:       #3fb950;
+      --green-dim:   #3fb95022;
+      --yellow:      #d29922;
+      --red:         #f85149;
+      --stage-done:  #0d2318;
+      --stage-cur:   #001a14;
+      --stage-next:  #0d1117;
+      --font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Courier New', monospace;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    /* ── Scrollbar ──────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+    /* ── Layout ─────────────────────────────────────────────────────── */
+    .shell {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 32px 24px 64px;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 36px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header-logo {
+      font-size: 11px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    .header-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.02em;
+    }
+    .header-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-left: auto;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Query input ────────────────────────────────────────────────── */
+    .query-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 32px;
+    }
+    .query-input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      padding: 10px 16px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .query-input::placeholder { color: var(--text-dim); }
+    .query-input:focus { border-color: var(--accent); }
+
+    .btn-analyse {
+      background: var(--accent);
+      border: none;
+      border-radius: 6px;
+      color: #000;
+      cursor: pointer;
+      font-family: var(--font);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 10px 24px;
+      text-transform: uppercase;
+      transition: opacity 0.15s, transform 0.1s;
+      white-space: nowrap;
+    }
+    .btn-analyse:hover:not(:disabled) { opacity: 0.85; }
+    .btn-analyse:active:not(:disabled) { transform: scale(0.97); }
+    .btn-analyse:disabled {
+      background: var(--border-hi);
+      color: var(--text-dim);
+      cursor: not-allowed;
+    }
+
+    /* ── Status bar ─────────────────────────────────────────────────── */
+    .status-bar {
+      height: 22px;
+      margin-bottom: 24px;
+      font-size: 11px;
+      color: var(--text-dim);
+      letter-spacing: 0.05em;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-bar .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .status-bar.running .dot {
+      background: var(--accent);
+      animation: pulse 1s ease-in-out infinite;
+    }
+    .status-bar.error .dot { background: var(--red); }
+    .status-bar.done .dot  { background: var(--green); }
+
+    .elapsed {
+      margin-left: auto;
+      font-size: 10px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.04em;
+    }
+    .elapsed.running { color: var(--accent); }
+
+    /* ── Cached badge ───────────────────────────────────────────────── */
+    .cached-badge {
+      display: none;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 3px;
+      background: #001a2a;
+      color: #58a6ff;
+      border: 1px solid #1e4a7a;
+      margin-left: 8px;
+    }
+    .cached-badge.visible { display: inline-block; }
+
+    /* ── Progress log ───────────────────────────────────────────────── */
+    .progress-wrap {
+      margin-bottom: 24px;
+      display: none;
+    }
+    .progress-wrap.visible { display: block; }
+    .progress-log {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      max-height: 160px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .progress-line {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      font-size: 11px;
+      color: var(--text-mid);
+      animation: fadein 0.2s ease;
+    }
+    .progress-line.active { color: var(--accent); }
+    .progress-line .pl-time {
+      flex-shrink: 0;
+      color: var(--text-dim);
+      font-size: 10px;
+      min-width: 38px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    .progress-line .pl-tick { flex-shrink: 0; }
+    .progress-line.done .pl-tick  { color: var(--green); }
+    .progress-line.active .pl-tick { color: var(--accent); }
+    @keyframes fadein {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* ── Pipeline diagram ───────────────────────────────────────────── */
+    .pipeline-wrap {
+      margin-bottom: 28px;
+    }
+    .section-label {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+    .pipeline {
+      display: flex;
+      align-items: center;
+      gap: 0;
+    }
+    .stage-node {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 14px 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--stage-next);
+      transition: all 0.3s ease;
+      position: relative;
+    }
+    .stage-node .stage-num {
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 0.08em;
+    }
+    .stage-node .stage-icon {
+      font-size: 20px;
+      line-height: 1;
+    }
+    .stage-node .stage-name {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      text-align: center;
+    }
+    .stage-node .stage-score {
+      font-size: 10px;
+      color: var(--text-dim);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    /* State: completed (past stages) */
+    .stage-node.completed {
+      background: var(--stage-done);
+      border-color: var(--green);
+    }
+    .stage-node.completed .stage-num  { color: var(--green); }
+    .stage-node.completed .stage-name { color: var(--green); }
+    .stage-node.completed .stage-score { opacity: 1; color: var(--green); }
+
+    /* State: current */
+    .stage-node.current {
+      background: var(--stage-cur);
+      border-color: var(--accent);
+      box-shadow: 0 0 18px var(--accent-glow), inset 0 0 12px var(--accent-dim);
+    }
+    .stage-node.current .stage-num  { color: var(--accent); }
+    .stage-node.current .stage-name { color: var(--accent); }
+    .stage-node.current .stage-score { opacity: 1; color: var(--accent); }
+    .stage-node.current::after {
+      content: '';
+      position: absolute;
+      inset: -1px;
+      border-radius: 6px;
+      border: 1px solid var(--accent);
+      animation: border-glow 2s ease-in-out infinite;
+    }
+    @keyframes border-glow {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    .stage-arrow {
+      flex-shrink: 0;
+      width: 28px;
+      text-align: center;
+      color: var(--border-hi);
+      font-size: 14px;
+      user-select: none;
+    }
+    .stage-arrow.lit { color: var(--green); }
+
+    /* ── Results grid ───────────────────────────────────────────────── */
+    .results-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 18px 20px;
+    }
+    .card-title {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 14px;
+    }
+
+    /* ── Narrative card (full width) ────────────────────────────────── */
+    .card-narrative {
+      grid-column: 1 / -1;
+    }
+    .narrative-body {
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.75;
+      min-height: 64px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .cursor {
+      display: inline-block;
+      width: 7px;
+      height: 14px;
+      background: var(--accent);
+      vertical-align: text-bottom;
+      animation: blink 0.7s step-end infinite;
+    }
+    .cursor.hidden { display: none; }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0; }
+    }
+
+    /* ── Confidence card ────────────────────────────────────────────── */
+    .confidence-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .confidence-score {
+      font-size: 36px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.03em;
+      line-height: 1;
+    }
+    .confidence-denom {
+      font-size: 14px;
+      color: var(--text-dim);
+    }
+    .reliability-badge {
+      margin-left: auto;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 4px;
+      background: var(--border);
+      color: var(--text-dim);
+    }
+    .reliability-badge.high   { background: var(--green-dim); color: var(--green); }
+    .reliability-badge.medium { background: #2a2200; color: var(--yellow); }
+    .reliability-badge.low    { background: #200a0a; color: var(--red); }
+
+    .conf-bar-track {
+      height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+    .conf-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 0.8s ease;
+    }
+    .conf-label {
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* Evidence quality sub-lists */
+    .evidence-list {
+      margin-top: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .evidence-item {
+      font-size: 11px;
+      color: var(--text-mid);
+      padding-left: 12px;
+      position: relative;
+    }
+    .evidence-item::before {
+      content: '▸';
+      position: absolute;
+      left: 0;
+      color: var(--text-dim);
+    }
+    .evidence-item.contra::before { color: var(--red); content: '▾'; }
+    .evidence-item.unsupported::before { color: var(--yellow); content: '?'; }
+
+    /* ── Velocity card ──────────────────────────────────────────────── */
+    .velocity-display {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 10px;
+    }
+    .velocity-arrow {
+      font-size: 40px;
+      line-height: 1;
+    }
+    .velocity-arrow.up   { color: var(--green); }
+    .velocity-arrow.flat { color: var(--yellow); }
+    .velocity-arrow.down { color: var(--red); }
+
+    .velocity-label {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .velocity-label.up   { color: var(--green); }
+    .velocity-label.flat { color: var(--yellow); }
+    .velocity-label.down { color: var(--red); }
+
+    .velocity-summary {
+      font-size: 11px;
+      color: var(--text-mid);
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+    .velocity-eta {
+      margin-top: 10px;
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 6px 10px;
+      background: var(--surface2);
+      border-radius: 4px;
+      border-left: 2px solid var(--accent);
+    }
+
+    /* ── Sources card ───────────────────────────────────────────────── */
+    .sources-card {
+      grid-column: 1 / -1;
+    }
+    .sources-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    .source-item {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 7px 10px;
+      background: var(--surface2);
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .source-tag {
+      flex-shrink: 0;
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: var(--border);
+      color: var(--text-dim);
+    }
+    .source-tag.paper   { background: #0d1b2a; color: #58a6ff; }
+    .source-tag.article { background: #1a1200; color: var(--yellow); }
+    .source-tag.company { background: var(--green-dim); color: var(--green); }
+    .source-tag.patent  { background: #1a0a1a; color: #d2a8ff; }
+    .source-tag.trend   { background: #001a1a; color: var(--accent); }
+
+    .source-name {
+      flex: 1;
+      font-size: 11px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .source-date {
+      flex-shrink: 0;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    .empty-hint {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-style: italic;
+    }
+
+    /* ── Conflicts panel ────────────────────────────────────────────── */
+    .conflicts-wrap {
+      display: none;
+      margin-top: 16px;
+    }
+    .conflicts-wrap.visible { display: block; }
+    .conflict-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #120a00;
+      border: 1px solid #3a2800;
+      border-radius: 4px;
+      margin-bottom: 6px;
+      font-size: 11px;
+      color: var(--yellow);
+    }
+    .conflict-item::before { content: '⚠'; flex-shrink: 0; }
+
+    /* ── Alerts panel ───────────────────────────────────────────────── */
+    .alerts-wrap {
+      margin-top: 32px;
+      border-top: 1px solid var(--border);
+      padding-top: 24px;
+    }
+    .alerts-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .alerts-refresh {
+      background: none;
+      border: 1px solid var(--border-hi);
+      color: var(--text-mid);
+      font-family: var(--font);
+      font-size: 10px;
+      padding: 3px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      transition: border-color 0.2s, color 0.2s;
+    }
+    .alerts-refresh:hover { border-color: var(--accent); color: var(--accent); }
+    .alert-item {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px 12px;
+      align-items: start;
+      padding: 10px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      margin-bottom: 6px;
+      font-size: 11px;
+    }
+    .alert-item.stage-transition { border-left: 3px solid var(--yellow); }
+    .alert-item.significant-change { border-left: 3px solid var(--accent); }
+    .alert-type-badge {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 2px 7px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    .alert-type-badge.stage-transition { background: #2a2200; color: var(--yellow); }
+    .alert-type-badge.significant-change { background: var(--accent-dim); color: var(--accent); }
+    .alert-tech { color: var(--text); font-weight: 700; }
+    .alert-detail { color: var(--text-mid); grid-column: 2; }
+    .alert-ts { color: var(--text-dim); font-size: 10px; white-space: nowrap; text-align: right; }
+    .alerts-empty { color: var(--text-dim); font-size: 11px; padding: 8px 0; }
+
+    /* ── Error toast ────────────────────────────────────────────────── */
+    .error-toast {
+      display: none;
+      background: #200a0a;
+      border: 1px solid var(--red);
+      border-radius: 6px;
+      padding: 12px 16px;
+      color: var(--red);
+      font-size: 12px;
+      margin-bottom: 16px;
+    }
+    .error-toast.visible { display: block; }
+
+    /* ── Responsive ─────────────────────────────────────────────────── */
+    @media (max-width: 700px) {
+      .results-grid { grid-template-columns: 1fr; }
+      .card-narrative, .sources-card { grid-column: 1; }
+      .pipeline { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; }
+      .stage-arrow { width: 16px; font-size: 10px; }
+      .stage-node { padding: 10px 4px; }
+      .stage-node .stage-name { font-size: 8px; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- Header -->
+  <header class="header">
+    <span class="header-logo">▶ TechPulse</span>
+    <span class="header-title">Technology Pipeline Tracker</span>
+    <span class="header-sub">Academic → Mainstream Intelligence</span>
+  </header>
+
+  <!-- Query input -->
+  <div class="query-row">
+    <input
+      id="queryInput"
+      class="query-input"
+      type="text"
+      placeholder="Enter a technology or concept…  e.g. &quot;quantum error correction&quot;"
+      autocomplete="off"
+      spellcheck="false"
+    />
+    <button id="analyseBtn" class="btn-analyse" onclick="runAnalysis()">
+      Analyse
+    </button>
+  </div>
+
+  <!-- Status bar -->
+  <div id="statusBar" class="status-bar">
+    <span class="dot"></span>
+    <span id="statusText">Ready</span>
+    <span class="cached-badge" id="cachedBadge">CACHED</span>
+    <span class="elapsed" id="elapsedDisplay"></span>
+  </div>
+
+  <!-- Error toast -->
+  <div id="errorToast" class="error-toast"></div>
+
+  <!-- Pipeline diagram -->
+  <div class="pipeline-wrap">
+    <div class="section-label">Pipeline Stage</div>
+    <div class="pipeline" id="pipeline">
+      <!-- Nodes injected by JS -->
+    </div>
+  </div>
+
+  <!-- Progress log -->
+  <div class="progress-wrap" id="progressWrap">
+    <div class="section-label">Pipeline Progress</div>
+    <div class="progress-log" id="progressLog"></div>
+  </div>
+
+  <!-- Results -->
+  <div class="results-grid">
+
+    <!-- Narrative (full width) -->
+    <div class="card card-narrative">
+      <div class="card-title">Analysis Narrative</div>
+      <div class="narrative-body" id="narrativeBody">
+        <span class="empty-hint">Analysis will stream here…</span>
+      </div>
+    </div>
+
+    <!-- Confidence -->
+    <div class="card">
+      <div class="card-title">Confidence Score</div>
+      <div class="confidence-row">
+        <span class="confidence-score" id="confScore">—</span>
+        <span class="confidence-denom" id="confDenom"></span>
+        <span class="reliability-badge" id="reliabilityBadge">—</span>
+      </div>
+      <div class="conf-bar-track">
+        <div class="conf-bar-fill" id="confBar"></div>
+      </div>
+      <div class="conf-label" id="confLabel">Awaiting analysis</div>
+      <div class="evidence-list" id="evidenceList"></div>
+    </div>
+
+    <!-- Velocity -->
+    <div class="card">
+      <div class="card-title">Velocity Indicator</div>
+      <div class="velocity-display">
+        <span class="velocity-arrow" id="velocityArrow">—</span>
+        <div>
+          <div class="velocity-label" id="velocityLabel">Awaiting data</div>
+        </div>
+      </div>
+      <div class="velocity-summary" id="velocitySummary"></div>
+      <div class="velocity-eta" id="velocityEta" style="display:none"></div>
+    </div>
+
+    <!-- Sources (full width) -->
+    <div class="card sources-card">
+      <div class="card-title">Sources Cited</div>
+      <div class="sources-list" id="sourcesList">
+        <span class="empty-hint">No sources yet</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Conflicting signals -->
+  <div class="conflicts-wrap" id="conflictsWrap">
+    <div class="section-label">Conflicting Signals</div>
+    <div id="conflictsList"></div>
+  </div>
+
+  <!-- Monitoring alerts -->
+  <div class="alerts-wrap">
+    <div class="alerts-header">
+      <div class="section-label" style="margin-bottom:0">Recent Monitoring Alerts</div>
+      <button class="alerts-refresh" onclick="loadAlerts()">Refresh</button>
+    </div>
+    <div id="alertsList"><span class="alerts-empty">Loading alerts…</span></div>
+  </div>
+
+</div><!-- .shell -->
+
+<script>
+  // ── Elapsed timer ────────────────────────────────────────────────────────
+  let _timerStart  = null;
+  let _timerHandle = null;
+
+  function startTimer() {
+    _timerStart = Date.now();
+    const el = document.getElementById('elapsedDisplay');
+    el.className = 'elapsed running';
+    _timerHandle = setInterval(() => {
+      const secs = ((Date.now() - _timerStart) / 1000).toFixed(1);
+      el.textContent = secs + 's';
+    }, 100);
+  }
+
+  function stopTimer() {
+    if (_timerHandle) { clearInterval(_timerHandle); _timerHandle = null; }
+    const el = document.getElementById('elapsedDisplay');
+    el.className = 'elapsed';
+    if (_timerStart) {
+      const secs = ((Date.now() - _timerStart) / 1000).toFixed(1);
+      el.textContent = secs + 's';
+    }
+  }
+
+  function elapsedSecs() {
+    return _timerStart ? ((Date.now() - _timerStart) / 1000).toFixed(1) : '0.0';
+  }
+
+  // ── Progress log ─────────────────────────────────────────────────────────
+  let _lastProgressLine = null;
+
+  function showProgressLog() {
+    const wrap = document.getElementById('progressWrap');
+    wrap.classList.add('visible');
+  }
+
+  function hideProgressLog() {
+    document.getElementById('progressWrap').classList.remove('visible');
+    document.getElementById('progressLog').innerHTML = '';
+    _lastProgressLine = null;
+  }
+
+  function addProgressLine(msg, elapsed) {
+    const log = document.getElementById('progressLog');
+    // Mark previous active line as done
+    if (_lastProgressLine) {
+      _lastProgressLine.classList.remove('active');
+      _lastProgressLine.classList.add('done');
+      const tick = _lastProgressLine.querySelector('.pl-tick');
+      if (tick) tick.textContent = '✓';
+    }
+    const line = document.createElement('div');
+    line.className = 'progress-line active';
+    const ts = elapsed != null ? elapsed + 's' : elapsedSecs() + 's';
+    line.innerHTML =
+      `<span class="pl-time">${ts}</span>` +
+      `<span class="pl-tick">▸</span>` +
+      `<span>${escHtml(msg)}</span>`;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+    _lastProgressLine = line;
+  }
+
+  function finaliseProgressLog(msg) {
+    if (_lastProgressLine) {
+      _lastProgressLine.classList.remove('active');
+      _lastProgressLine.classList.add('done');
+      const tick = _lastProgressLine.querySelector('.pl-tick');
+      if (tick) tick.textContent = '✓';
+    }
+    if (msg) addProgressLine(msg, null);
+    if (_lastProgressLine) {
+      _lastProgressLine.classList.remove('active');
+      _lastProgressLine.classList.add('done');
+      const tick = _lastProgressLine.querySelector('.pl-tick');
+      if (tick) tick.textContent = '✓';
+    }
+  }
+
+  // ── Stage definitions ────────────────────────────────────────────────────
+  const STAGES = [
+    { num: 1, label: 'Academic',    icon: '📄', scoreKey: null },
+    { num: 2, label: 'Startups',    icon: '🚀', scoreKey: null },
+    { num: 3, label: 'Investment',  icon: '💰', scoreKey: null },
+    { num: 4, label: 'Big Tech',    icon: '🏢', scoreKey: null },
+    { num: 5, label: 'Mainstream',  icon: '🌐', scoreKey: null },
+  ];
+
+  // ── Build pipeline DOM ───────────────────────────────────────────────────
+  function buildPipeline() {
+    const container = document.getElementById('pipeline');
+    container.innerHTML = '';
+    STAGES.forEach((s, i) => {
+      const node = document.createElement('div');
+      node.className = 'stage-node';
+      node.id = `stage-${s.num}`;
+      node.innerHTML = `
+        <span class="stage-num">0${s.num}</span>
+        <span class="stage-icon">${s.icon}</span>
+        <span class="stage-name">${s.label}</span>
+        <span class="stage-score" id="stage-score-${s.num}"></span>
+      `;
+      container.appendChild(node);
+
+      if (i < STAGES.length - 1) {
+        const arrow = document.createElement('div');
+        arrow.className = 'stage-arrow';
+        arrow.id = `arrow-${s.num}`;
+        arrow.textContent = '→';
+        container.appendChild(arrow);
+      }
+    });
+  }
+
+  function updatePipeline(currentStage, scores) {
+    STAGES.forEach(s => {
+      const node  = document.getElementById(`stage-${s.num}`);
+      const arrow = document.getElementById(`arrow-${s.num}`);
+      const scoreEl = document.getElementById(`stage-score-${s.num}`);
+
+      node.classList.remove('completed', 'current');
+
+      if (s.num < currentStage) {
+        node.classList.add('completed');
+        if (arrow) arrow.classList.add('lit');
+      } else if (s.num === currentStage) {
+        node.classList.add('current');
+      } else {
+        if (arrow) arrow.classList.remove('lit');
+      }
+
+      // Show score per stage if available in scores dict
+      const stageScoreMap = {
+        1: ['arxiv_score', 'semantic_scholar_score'],
+        2: ['github_score', 'producthunt_score', 'yc_score'],
+        3: ['news_score', 'techcrunch_score'],
+        4: ['patents_score'],
+        5: ['wikipedia_score', 'trends_score'],
+      };
+      const keys = stageScoreMap[s.num] || [];
+      if (scores && keys.length) {
+        const avg = keys.reduce((acc, k) => acc + (scores[k] || 0), 0) / keys.length;
+        scoreEl.textContent = avg.toFixed(0);
+      }
+    });
+  }
+
+  // ── Confidence ───────────────────────────────────────────────────────────
+  function updateConfidence(score, reliability, supporting, contradicting, unsupported) {
+    const pct = Math.min(100, Math.max(0, score || 0));
+    document.getElementById('confScore').textContent = pct;
+    document.getElementById('confDenom').textContent = '/ 100';
+    document.getElementById('confBar').style.width = pct + '%';
+    document.getElementById('confLabel').textContent =
+      pct >= 70 ? 'Well-supported conclusion' :
+      pct >= 40 ? 'Partially supported — some gaps' :
+                  'Thin evidence — treat with caution';
+
+    // Colour the bar by confidence tier
+    const bar = document.getElementById('confBar');
+    bar.style.background = pct >= 70 ? 'var(--green)' : pct >= 40 ? 'var(--yellow)' : 'var(--red)';
+
+    const badge = document.getElementById('reliabilityBadge');
+    badge.textContent = reliability || '—';
+    badge.className = 'reliability-badge ' + (reliability || '').toLowerCase();
+
+    // Evidence quality lists
+    const listEl = document.getElementById('evidenceList');
+    listEl.innerHTML = '';
+    (supporting || []).slice(0, 3).forEach(e => {
+      const d = document.createElement('div');
+      d.className = 'evidence-item';
+      d.textContent = e;
+      listEl.appendChild(d);
+    });
+    (contradicting || []).slice(0, 2).forEach(e => {
+      const d = document.createElement('div');
+      d.className = 'evidence-item contra';
+      d.textContent = e;
+      listEl.appendChild(d);
+    });
+    (unsupported || []).slice(0, 2).forEach(e => {
+      const d = document.createElement('div');
+      d.className = 'evidence-item unsupported';
+      d.textContent = e;
+      listEl.appendChild(d);
+    });
+  }
+
+  // ── Velocity ─────────────────────────────────────────────────────────────
+  function updateVelocity(velocityData) {
+    if (!velocityData) return;
+    const dir = (velocityData.direction || velocityData.velocity_summary || '').toLowerCase();
+
+    let arrowChar, arrowClass, labelText, labelClass;
+    if (dir.includes('accel') || dir.includes('rapid') || dir.includes('gaining')) {
+      arrowChar = '↑'; arrowClass = 'up'; labelText = 'Accelerating'; labelClass = 'up';
+    } else if (dir.includes('deceler') || dir.includes('declin') || dir.includes('cooling') || dir.includes('stall')) {
+      arrowChar = '↓'; arrowClass = 'down'; labelText = 'Declining'; labelClass = 'down';
+    } else {
+      arrowChar = '→'; arrowClass = 'flat'; labelText = 'Steady'; labelClass = 'flat';
+    }
+
+    const arrowEl = document.getElementById('velocityArrow');
+    const labelEl = document.getElementById('velocityLabel');
+    arrowEl.textContent = arrowChar;
+    arrowEl.className = 'velocity-arrow ' + arrowClass;
+    labelEl.textContent = labelText;
+    labelEl.className = 'velocity-label ' + labelClass;
+
+    const summary = velocityData.velocity_summary || velocityData.summary || '';
+    document.getElementById('velocitySummary').textContent = summary;
+
+    const etaEl = document.getElementById('velocityEta');
+    const months = velocityData.estimated_next_stage_months;
+    if (months != null) {
+      etaEl.textContent = `Next stage estimated in ~${months} months`;
+      etaEl.style.display = 'block';
+    } else {
+      etaEl.style.display = 'none';
+    }
+  }
+
+  // ── Sources ───────────────────────────────────────────────────────────────
+  function renderSources(sources) {
+    const el = document.getElementById('sourcesList');
+    if (!sources || sources.length === 0) {
+      el.innerHTML = '<span class="empty-hint">No sources cited</span>';
+      return;
+    }
+    el.innerHTML = sources.map(s => {
+      const tag = (s.type || 'source').toLowerCase();
+      return `
+        <div class="source-item">
+          <span class="source-tag ${tag}">${tag}</span>
+          <span class="source-name" title="${escHtml(s.name || '')}">${escHtml(s.name || '—')}</span>
+          <span class="source-date">${escHtml(s.date || '')}</span>
+        </div>`;
+    }).join('');
+  }
+
+  // ── Conflicting signals ──────────────────────────────────────────────────
+  function renderConflicts(signals) {
+    const wrap = document.getElementById('conflictsWrap');
+    const list = document.getElementById('conflictsList');
+    if (!signals || signals.length === 0) {
+      wrap.classList.remove('visible');
+      return;
+    }
+    wrap.classList.add('visible');
+    list.innerHTML = signals.map(s =>
+      `<div class="conflict-item">${escHtml(s)}</div>`
+    ).join('');
+  }
+
+  // ── Status helpers ────────────────────────────────────────────────────────
+  function setStatus(msg, state) {
+    const bar = document.getElementById('statusBar');
+    bar.className = 'status-bar ' + (state || '');
+    document.getElementById('statusText').textContent = msg;
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('errorToast');
+    el.textContent = msg;
+    el.classList.add('visible');
+  }
+
+  function hideError() {
+    document.getElementById('errorToast').classList.remove('visible');
+  }
+
+  // ── Narrative streaming ───────────────────────────────────────────────────
+  let narrativeBuffer = '';
+  let cursorEl = null;
+
+  function initNarrative() {
+    narrativeBuffer = '';
+    const body = document.getElementById('narrativeBody');
+    body.textContent = '';
+    cursorEl = document.createElement('span');
+    cursorEl.className = 'cursor';
+    body.appendChild(cursorEl);
+  }
+
+  function appendToken(token) {
+    narrativeBuffer += token;
+    const body = document.getElementById('narrativeBody');
+    // Insert before cursor
+    const textNode = document.createTextNode(token);
+    body.insertBefore(textNode, cursorEl);
+  }
+
+  function finaliseNarrative(finalText) {
+    const body = document.getElementById('narrativeBody');
+    body.textContent = finalText || narrativeBuffer;
+  }
+
+  function hideCursor() {
+    if (cursorEl) cursorEl.className = 'cursor hidden';
+  }
+
+  // ── Main analysis runner ─────────────────────────────────────────────────
+  async function runAnalysis() {
+    const query = document.getElementById('queryInput').value.trim();
+    if (!query) {
+      document.getElementById('queryInput').focus();
+      return;
+    }
+
+    // Reset UI
+    hideError();
+    buildPipeline();
+    initNarrative();
+    renderSources([]);
+    renderConflicts([]);
+    hideProgressLog();
+    document.getElementById('cachedBadge').classList.remove('visible');
+    document.getElementById('elapsedDisplay').textContent = '';
+    document.getElementById('confScore').textContent = '—';
+    document.getElementById('confDenom').textContent = '';
+    document.getElementById('confBar').style.width = '0%';
+    document.getElementById('confLabel').textContent = 'Awaiting analysis';
+    document.getElementById('reliabilityBadge').textContent = '—';
+    document.getElementById('reliabilityBadge').className = 'reliability-badge';
+    document.getElementById('evidenceList').innerHTML = '';
+    document.getElementById('velocityArrow').textContent = '—';
+    document.getElementById('velocityArrow').className = 'velocity-arrow';
+    document.getElementById('velocityLabel').textContent = 'Awaiting data';
+    document.getElementById('velocityLabel').className = 'velocity-label';
+    document.getElementById('velocitySummary').textContent = '';
+    document.getElementById('velocityEta').style.display = 'none';
+
+    const btn = document.getElementById('analyseBtn');
+    btn.disabled = true;
+    startTimer();
+    setStatus('Connecting…', 'running');
+
+    try {
+      const resp = await fetch('/analyse/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${txt}`);
+      }
+
+      const reader  = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer    = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep any partial line
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          let payload;
+          try { payload = JSON.parse(line.slice(6)); }
+          catch (_) { continue; }
+          handleEvent(payload);
+        }
+      }
+
+    } catch (err) {
+      showError(err.message || String(err));
+      setStatus('Error', 'error');
+      hideCursor();
+      stopTimer();
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function handleEvent(payload) {
+    const ev = payload.event;
+
+    if (ev === 'status') {
+      const msg = payload.message || '';
+      setStatus(msg, 'running');
+      showProgressLog();
+      addProgressLine(msg, payload.elapsed != null ? payload.elapsed : null);
+
+    } else if (ev === 'scores') {
+      const scores = payload.scores || {};
+      const stage  = scores.overall_stage || 1;
+      updatePipeline(stage, scores);
+      const cacheNote = payload.message && payload.message.includes('cached') ? ' (cached)' : '';
+      setStatus(`Pipeline complete — Stage ${stage} detected${cacheNote}`, 'running');
+
+    } else if (ev === 'token') {
+      appendToken(payload.token || '');
+
+    } else if (ev === 'complete') {
+      stopTimer();
+      hideCursor();
+      const assessment = payload.assessment || {};
+      const velocity   = payload.velocity   || {};
+      const isCached   = !!payload.cached;
+
+      // Show cached badge
+      if (isCached) {
+        document.getElementById('cachedBadge').classList.add('visible');
+      }
+
+      // Finalise progress log
+      finaliseProgressLog(isCached ? 'Served from cache' : 'Analysis complete');
+
+      // Narrative — use Claude's final text if available, else buffer
+      finaliseNarrative(assessment.narrative || narrativeBuffer);
+
+      // Pipeline — re-render with confirmed stage
+      const stage = assessment.stage || assessment.confirmed_stage || 1;
+      updatePipeline(stage, null);
+
+      // Confidence
+      updateConfidence(
+        assessment.confidence,
+        assessment.reliability,
+        assessment.supporting_evidence,
+        assessment.contradicting_evidence,
+        assessment.unsupported_claims,
+      );
+
+      // Velocity
+      const velocityAssessment = assessment.velocity_assessment || velocity;
+      updateVelocity(velocityAssessment);
+
+      // Sources
+      renderSources(assessment.sources_cited || []);
+
+      // Conflicts
+      renderConflicts(assessment.conflicting_signals || []);
+
+      const elapsed = payload.elapsed != null ? ` · ${payload.elapsed}s` : '';
+      const cacheTag = isCached ? ' · CACHED' : '';
+      setStatus(
+        `Stage ${stage}: ${assessment.stage_label || ''} ` +
+        `· confidence ${assessment.confidence || '—'}/100${cacheTag}${elapsed}`,
+        'done'
+      );
+
+    } else if (ev === 'error') {
+      stopTimer();
+      showError(payload.message || 'Unknown error');
+      setStatus('Error', 'error');
+      hideCursor();
+      if (_lastProgressLine) {
+        _lastProgressLine.classList.remove('active');
+        _lastProgressLine.querySelector('.pl-tick').textContent = '✗';
+        _lastProgressLine.style.color = 'var(--red)';
+      }
+    }
+  }
+
+  // ── Utilities ────────────────────────────────────────────────────────────
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // ── Monitoring alerts ─────────────────────────────────────────────────────
+  function fmtAlertTs(ts) {
+    if (!ts) return '';
+    try {
+      const d = new Date(ts);
+      return d.toLocaleString(undefined, {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+    } catch (_) { return ts; }
+  }
+
+  function renderAlerts(alerts) {
+    const el = document.getElementById('alertsList');
+    if (!alerts || alerts.length === 0) {
+      el.innerHTML = '<span class="alerts-empty">No alerts yet — run <code>python scripts/monitor.py</code> to populate.</span>';
+      return;
+    }
+    el.innerHTML = alerts.map(a => {
+      const typeKey = (a.alert_type || '').toLowerCase().replace('_', '-');
+      const typeBadge = typeKey === 'stage-transition' ? 'Stage Transition' : 'Significant Change';
+      let detail = escHtml(a.message || '');
+      if (!detail) {
+        if (a.alert_type === 'STAGE_TRANSITION' && a.previous_stage != null && a.new_stage != null) {
+          detail = `Stage ${a.previous_stage} → ${a.new_stage}`;
+        } else if (a.previous_score != null && a.new_score != null) {
+          const delta = (a.new_score - a.previous_score).toFixed(1);
+          const sign  = delta >= 0 ? '+' : '';
+          detail = `Score ${a.previous_score.toFixed(1)} → ${a.new_score.toFixed(1)} (${sign}${delta})`;
+        }
+      }
+      return `<div class="alert-item ${typeKey}">
+        <span class="alert-type-badge ${typeKey}">${typeBadge}</span>
+        <span class="alert-tech">${escHtml(a.technology || '')}</span>
+        <span class="alert-ts">${fmtAlertTs(a.timestamp)}</span>
+        <span class="alert-detail" style="grid-column:1/-1;padding-top:2px;color:var(--text-mid)">${detail}</span>
+      </div>`;
+    }).join('');
+  }
+
+  async function loadAlerts() {
+    const el = document.getElementById('alertsList');
+    el.innerHTML = '<span class="alerts-empty">Loading…</span>';
+    try {
+      const resp = await fetch('/alerts?limit=20');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      renderAlerts(data.alerts || []);
+    } catch (err) {
+      el.innerHTML = `<span class="alerts-empty" style="color:var(--red)">Could not load alerts: ${escHtml(err.message)}</span>`;
+    }
+  }
+
+  // Allow Enter key to trigger analysis
+  document.getElementById('queryInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') runAnalysis();
+  });
+
+  // Initial pipeline render + alerts load
+  buildPipeline();
+  loadAlerts();
+</script>
+</body>
+</html>
